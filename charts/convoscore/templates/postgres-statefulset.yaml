@@ -49,6 +49,11 @@ spec:
           readinessProbe:
             exec:
               command: ["pg_isready", "-U", {{ .Values.postgres.user | quote }}]
+            # Default exec-probe timeout (1s) was observed flapping under
+            # real load on this machine (219 spurious failures over 95
+            # minutes, all self-recovering) - pg_isready is lightweight but
+            # not instant under CPU contention. See DECISIONS.md.
+            timeoutSeconds: 3
           resources:
             {{- toYaml .Values.postgres.resources | nindent 12 }}
   volumeClaimTemplates:

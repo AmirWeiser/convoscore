@@ -37,14 +37,25 @@ app.mount("/metrics", make_asgi_app())
 class _MetricsMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         start = time.monotonic()
-        response = await call_next(request)
-        duration = time.monotonic() - start
         # Route template (e.g. "/conversations/{conversation_id}"), never the
         # resolved path - a resolved path would put a fresh UUID in a label
         # value per request, the exact unbounded-cardinality mistake this
         # project avoids elsewhere. See DECISIONS.md.
         route = request.scope.get("route")
         path = route.path if route else "unmatched"
+        try:
+            response = await call_next(request)
+        except Exception:
+            # An unhandled exception must still be counted (as 500) and
+            # timed, not silently drop out of the metrics entirely - and the
+            # exception itself must propagate unchanged so Starlette's own
+            # error handling still produces the real response. See
+            # DECISIONS.md.
+            duration = time.monotonic() - start
+            http_requests_total.labels(request.method, path, "500").inc()
+            http_request_duration_seconds.labels(request.method, path).observe(duration)
+            raise
+        duration = time.monotonic() - start
         http_requests_total.labels(request.method, path, str(response.status_code)).inc()
         http_request_duration_seconds.labels(request.method, path).observe(duration)
         return response

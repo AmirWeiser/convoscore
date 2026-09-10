@@ -60,8 +60,12 @@ class OpenAIScorer:
         if message.refusal:
             # One error path for any scoring failure, refusal included - see
             # DECISIONS.md. Retried like any other failure, bounded by the
-            # same max-attempts.
-            raise RuntimeError(f"model refused to score: {message.refusal}")
+            # same max-attempts. Deliberately does NOT include
+            # message.refusal's own text in the exception - a model's
+            # refusal explanation can echo back part of the flagged input,
+            # which would then propagate into logs/DB error fields. See
+            # DECISIONS.md.
+            raise RuntimeError("model refused to score")
 
         parsed = message.parsed
         usage = response.usage

@@ -6,6 +6,7 @@ import logging
 import signal
 import threading
 import time
+import traceback
 from urllib.parse import unquote_plus
 
 from botocore.exceptions import BotoCoreError, ClientError
@@ -54,6 +55,20 @@ def _safe_message_context(message: dict) -> dict:
     return context
 
 
+def _safe_stack_trace(exc: BaseException) -> str:
+    """Stack frames only - file/line/function, always safe - deliberately
+    never the exception's own str()/args. A third-party library's exception
+    message (OpenAI, boto3, psycopg) is not something this code controls the
+    content of, and has been found to be able to echo back request/response
+    content in some cases (see the OpenAI refusal-message fix in
+    openai_scorer.py) - so no exception message is ever logged or stored
+    anywhere in this project, only its type name plus this frame trail. See
+    DECISIONS.md, and tests/test_no_sensitive_data_in_logs.py for the test
+    that verifies this holds even with synthetic sensitive data forced
+    through this exact path."""
+    return "".join(traceback.format_tb(exc.__traceback__))
+
+
 def _process_message(sqs, s3, queue_url: str, message: dict) -> None:
     receipt_handle = message["ReceiptHandle"]
     receive_count = int(message.get("Attributes", {}).get("ApproximateReceiveCount", "1"))
@@ -81,10 +96,20 @@ def _process_message(sqs, s3, queue_url: str, message: dict) -> None:
     try:
         obj = s3.get_object(Bucket=bucket, Key=key)
         raw = obj["Body"].read().decode("utf-8", errors="replace")
-    except (BotoCoreError, ClientError):
+    except (BotoCoreError, ClientError) as exc:
         # Transient (network/service issue, not the object's fault) - leave
         # the message for standard SQS redelivery/DLQ. No conversation_id
         # exists yet to record anything against; DLQ depth is the signal.
+        # Still logged, on every attempt, not just the last - see
+        # DECISIONS.md.
+        logger.warning(
+            "s3 read failed",
+            extra={
+                "source_key": key,
+                "error_type": type(exc).__name__,
+                "receive_count": receive_count,
+            },
+        )
         return
 
     try:
@@ -94,7 +119,11 @@ def _process_message(sqs, s3, queue_url: str, message: dict) -> None:
             raise ValueError("'text' must be a non-empty string")
     except (json.JSONDecodeError, KeyError, ValueError) as exc:
         # Permanently invalid input - terminal immediately, never retried,
-        # never reaches the DLQ. See DECISIONS.md.
+        # never reaches the DLQ. See DECISIONS.md. These particular
+        # exception types (JSON position info / a missing key name / this
+        # module's own fixed message) don't carry conversation content, so
+        # str(exc) is safe here specifically - unlike the scoring path below,
+        # which talks to a third-party library and never uses str(exc).
         repository.record_validation_failure(key, "s3", raw, str(exc))
         conversations_processed_total.labels(outcome="failed").inc()
         logger.info(
@@ -116,22 +145,30 @@ def _process_message(sqs, s3, queue_url: str, message: dict) -> None:
     try:
         result = get_scorer().score(text)
     except Exception as exc:
-        if receive_count >= config.MAX_RECEIVE_COUNT:
+        exhausted = receive_count >= config.MAX_RECEIVE_COUNT
+        # Logged on every failed attempt, not only the last one - and never
+        # str(exc): a third-party (OpenAI/network) exception's own message is
+        # not something this code controls the content of. error_type (the
+        # exception's class name) plus a message-stripped stack trace is
+        # always safe. See DECISIONS.md and the focused leak test.
+        logger.warning(
+            "conversation scoring attempt failed",
+            extra={
+                "conversation_id": str(conversation_id),
+                "error_type": type(exc).__name__,
+                "receive_count": receive_count,
+                "exhausted": exhausted,
+                "stack_trace": _safe_stack_trace(exc),
+            },
+        )
+        if exhausted:
             # Last allowed attempt: record why, then leave the message
             # undeleted so SQS's own redrive policy - not us - moves it to
             # the DLQ. DLQ depth is the operational signal; this DB row stays
             # a documented 'failed' record rather than stuck 'processing'.
-            repository.mark_failed(conversation_id, "transient_exhausted", str(exc))
+            # error_message is the exception's type name only - see above.
+            repository.mark_failed(conversation_id, "transient_exhausted", type(exc).__name__)
             conversations_processed_total.labels(outcome="failed").inc()
-            logger.warning(
-                "conversation scoring failed, exhausted retries",
-                extra={
-                    "conversation_id": str(conversation_id),
-                    "error_category": "transient_exhausted",
-                    "error_type": type(exc).__name__,
-                    "receive_count": receive_count,
-                },
-            )
         return  # message stays undeleted either way - standard SQS redelivery
 
     openai_tokens_total.labels(direction="input").inc(result.input_tokens)
@@ -151,8 +188,11 @@ def _process_message(sqs, s3, queue_url: str, message: dict) -> None:
 def _update_dlq_depth_periodically(sqs) -> None:
     try:
         dlq_url = sqs.get_queue_url(QueueName=config.SQS_DLQ_NAME)["QueueUrl"]
-    except Exception:
-        logger.warning("could not resolve DLQ url for depth gauge", exc_info=True)
+    except Exception as exc:
+        logger.warning(
+            "could not resolve DLQ url for depth gauge",
+            extra={"error_type": type(exc).__name__, "stack_trace": _safe_stack_trace(exc)},
+        )
         return
     while not _shutdown:
         try:
@@ -160,8 +200,11 @@ def _update_dlq_depth_periodically(sqs) -> None:
                 QueueUrl=dlq_url, AttributeNames=["ApproximateNumberOfMessages"]
             )
             dlq_depth.set(int(attrs["Attributes"]["ApproximateNumberOfMessages"]))
-        except Exception:
-            logger.warning("failed to refresh DLQ depth gauge", exc_info=True)
+        except Exception as exc:
+            logger.warning(
+                "failed to refresh DLQ depth gauge",
+                extra={"error_type": type(exc).__name__, "stack_trace": _safe_stack_trace(exc)},
+            )
         time.sleep(30)
 
 
@@ -201,14 +244,18 @@ def main() -> None:
             except Exception as exc:
                 # Any unexpected failure (not just the scorer's) must never
                 # silently wedge this loop - see DECISIONS.md. Logged with
-                # whatever safe context is available (never conversation
-                # content/secrets) so it's actually debuggable, not just
-                # swallowed. Message stays undeleted; standard SQS
-                # redelivery/DLQ handles it like any other transient failure.
+                # whatever safe context is available - error type + a
+                # message-stripped stack trace, never str(exc) - so it's
+                # actually debuggable without risking a content/secret leak.
+                # Message stays undeleted; standard SQS redelivery/DLQ
+                # handles it like any other transient failure.
                 logger.error(
                     "unexpected error processing message",
-                    extra={**_safe_message_context(message), "error_type": type(exc).__name__},
-                    exc_info=True,
+                    extra={
+                        **_safe_message_context(message),
+                        "error_type": type(exc).__name__,
+                        "stack_trace": _safe_stack_trace(exc),
+                    },
                 )
 
 
