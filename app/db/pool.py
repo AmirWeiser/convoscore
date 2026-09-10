@@ -1,7 +1,6 @@
-import time
 from pathlib import Path
 
-from psycopg_pool import ConnectionPool, PoolTimeout
+from psycopg_pool import ConnectionPool
 
 from app.config import DATABASE_URL
 
@@ -21,25 +20,18 @@ def init_schema() -> None:
     """Idempotent - CREATE TABLE IF NOT EXISTS. One plain SQL file is the whole
     migration strategy; see DECISIONS.md for why Alembic isn't used for one table.
 
-    pool.open() retried with wait=True: observed on a real cluster that a
-    transient DNS blip on a freshly-started pod (CoreDNS not yet warmed up)
-    can leave a non-blocking pool.open() never establishing a working
-    connection, even after DNS itself recovers - the pool's own background
-    reconnect doesn't reliably self-heal from this. Waiting for and
-    confirming a real connection, with retries, fixes it at the source
-    instead of leaving a pod that reports healthy but can never do anything.
-    See DECISIONS.md.
+    pool.open(wait=True, timeout=30): a single call, not retried - a real bug
+    was found retrying this (psycopg_pool.PoolClosed: "pool has already been
+    opened/closed and cannot be reused" - open() is a one-shot lifecycle
+    transition, calling it again on the same pool after a failed attempt is
+    invalid, not a retry). A generous 30s wait gives a transient startup DNS
+    blip (CoreDNS not yet warmed up on a fresh pod) real room to resolve on
+    its own within this one call. If it still fails, this raises and the
+    process exits - the startupProbe's grace period plus Kubernetes'
+    restartPolicy is the actual recovery mechanism from there, the same
+    self-healing already relied on elsewhere in this design. See
+    DECISIONS.md.
     """
-    last_error: Exception | None = None
-    for _ in range(6):
-        try:
-            pool.open(wait=True, timeout=10)
-            break
-        except PoolTimeout as exc:
-            last_error = exc
-            time.sleep(5)
-    else:
-        raise RuntimeError(f"database pool never became ready: {last_error}")
-
+    pool.open(wait=True, timeout=30)
     with pool.connection() as conn:
         conn.execute(_SCHEMA_PATH.read_text())
