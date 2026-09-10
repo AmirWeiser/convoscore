@@ -1,0 +1,50 @@
+image:
+  repository: convoscore
+  tag: "3965051"
+  pullPolicy: IfNotPresent
+
+api:
+  replicaCount: 1
+  port: 8000
+  resources:
+    requests: { cpu: 50m, memory: 128Mi }
+    limits: { cpu: 200m, memory: 256Mi }
+
+worker:
+  replicaCount: 1
+  metricsPort: 9000
+  resources:
+    requests: { cpu: 50m, memory: 128Mi }
+    limits: { cpu: 200m, memory: 256Mi }
+
+postgres:
+  image: postgres:16-alpine
+  port: 5432
+  user: convoscore
+  db: convoscore
+  storage: 1Gi
+  resources:
+    requests: { cpu: 50m, memory: 128Mi }
+    limits: { cpu: 200m, memory: 256Mi }
+
+# host.minikube.internal: reaches the host-level LocalStack container from
+# inside minikube (docker driver) - see DECISIONS.md for the connectivity
+# validation. Resource names below must match terraform/variables.tf exactly.
+aws:
+  endpointUrl: "http://host.minikube.internal:4566"
+  region: us-east-1
+  bucketName: convoscore-conversations
+  queueName: convoscore-processing
+  dlqName: convoscore-processing-dlq
+  visibilityTimeoutSeconds: 60
+  maxReceiveCount: 3
+
+scoring:
+  provider: openai
+  model: gpt-4o-mini
+
+secrets:
+  # Created out-of-band by scripts/k8s-secrets.sh - never templated here,
+  # never stored in git. This chart only references them by name.
+  openaiSecretName: convoscore-openai
+  postgresSecretName: convoscore-postgres

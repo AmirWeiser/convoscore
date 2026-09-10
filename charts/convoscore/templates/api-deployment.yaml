@@ -1,0 +1,77 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: convoscore-api
+  labels:
+    {{- include "convoscore.labels" (dict "component" "api") | nindent 4 }}
+spec:
+  replicas: {{ .Values.api.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "convoscore.labels" (dict "component" "api") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "convoscore.labels" (dict "component" "api") | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: api
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "{{ .Values.api.port }}"]
+          ports:
+            - containerPort: {{ .Values.api.port }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          env:
+            # No OPENAI_API_KEY here - the API never calls OpenAI (see
+            # DECISIONS.md), so it only gets the secret it actually needs.
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.postgresSecretName }}
+                  key: DATABASE_URL
+            - name: AWS_ENDPOINT_URL
+              value: {{ .Values.aws.endpointUrl | quote }}
+            - name: AWS_REGION
+              value: {{ .Values.aws.region | quote }}
+            - name: S3_BUCKET_NAME
+              value: {{ .Values.aws.bucketName | quote }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          startupProbe:
+            # Generous grace before liveness/readiness evaluate at all -
+            # init_schema() blocks on Postgres before the port even opens,
+            # and a cold-start Postgres image pull can take minutes. Without
+            # this, liveness kills an otherwise-fine, still-starting pod.
+            # See DECISIONS.md.
+            httpGet:
+              path: /healthz
+              port: {{ .Values.api.port }}
+            periodSeconds: 5
+            failureThreshold: 60
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: {{ .Values.api.port }}
+          readinessProbe:
+            # DB reachability only - never OpenAI-dependent. See DECISIONS.md.
+            httpGet:
+              path: /readyz
+              port: {{ .Values.api.port }}
+          resources:
+            {{- toYaml .Values.api.resources | nindent 12 }}
+      volumes:
+        - name: tmp
+          emptyDir: {}

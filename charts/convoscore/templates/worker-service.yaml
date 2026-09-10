@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: convoscore-worker-metrics
+  labels:
+    {{- include "convoscore.labels" (dict "component" "worker") | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "convoscore.labels" (dict "component" "worker") | nindent 4 }}
+  ports:
+    - port: {{ .Values.worker.metricsPort }}
+      targetPort: {{ .Values.worker.metricsPort }}
+      name: metrics

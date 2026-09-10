@@ -98,8 +98,12 @@ def _process_message(sqs, s3, queue_url: str, message: dict) -> None:
 
 
 def main() -> None:
-    init_schema()
+    # Metrics server opens first, before the blocking DB call - so the
+    # liveness TCP check has something to connect to immediately, instead of
+    # seeing "connection refused" during a slow Postgres cold start and
+    # killing an otherwise-fine, still-starting pod. See DECISIONS.md.
     start_http_server(config.METRICS_PORT)
+    init_schema()
     signal.signal(signal.SIGTERM, _handle_shutdown_signal)
     signal.signal(signal.SIGINT, _handle_shutdown_signal)
 

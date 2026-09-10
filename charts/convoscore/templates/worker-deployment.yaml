@@ -1,0 +1,88 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: convoscore-worker
+  labels:
+    {{- include "convoscore.labels" (dict "component" "worker") | nindent 4 }}
+spec:
+  replicas: {{ .Values.worker.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "convoscore.labels" (dict "component" "worker") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "convoscore.labels" (dict "component" "worker") | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: worker
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["python", "-m", "app.worker"]
+          ports:
+            - containerPort: {{ .Values.worker.metricsPort }}
+              name: metrics
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.postgresSecretName }}
+                  key: DATABASE_URL
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.openaiSecretName }}
+                  key: OPENAI_API_KEY
+            - name: SCORER_PROVIDER
+              value: {{ .Values.scoring.provider | quote }}
+            - name: OPENAI_MODEL
+              value: {{ .Values.scoring.model | quote }}
+            - name: AWS_ENDPOINT_URL
+              value: {{ .Values.aws.endpointUrl | quote }}
+            - name: AWS_REGION
+              value: {{ .Values.aws.region | quote }}
+            - name: S3_BUCKET_NAME
+              value: {{ .Values.aws.bucketName | quote }}
+            - name: SQS_QUEUE_NAME
+              value: {{ .Values.aws.queueName | quote }}
+            - name: SQS_DLQ_NAME
+              value: {{ .Values.aws.dlqName | quote }}
+            - name: VISIBILITY_TIMEOUT_SECONDS
+              value: {{ .Values.aws.visibilityTimeoutSeconds | quote }}
+            - name: MAX_RECEIVE_COUNT
+              value: {{ .Values.aws.maxReceiveCount | quote }}
+            - name: METRICS_PORT
+              value: {{ .Values.worker.metricsPort | quote }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          startupProbe:
+            # Same rationale as the API's startupProbe - generous grace
+            # before liveness evaluates. See DECISIONS.md.
+            tcpSocket:
+              port: {{ .Values.worker.metricsPort }}
+            periodSeconds: 5
+            failureThreshold: 60
+          livenessProbe:
+            # Process-alive only, via a plain TCP check on the metrics port -
+            # no custom health routes. See DECISIONS.md. No readiness probe:
+            # the worker sits behind no user-facing routing, only a metrics
+            # Service for Prometheus (Phase 8).
+            tcpSocket:
+              port: {{ .Values.worker.metricsPort }}
+          resources:
+            {{- toYaml .Values.worker.resources | nindent 12 }}
+      volumes:
+        - name: tmp
+          emptyDir: {}
