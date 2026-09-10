@@ -4,6 +4,7 @@
 import json
 import signal
 import time
+from urllib.parse import unquote_plus
 
 from botocore.exceptions import BotoCoreError, ClientError
 from prometheus_client import start_http_server
@@ -43,15 +44,17 @@ def _process_message(sqs, s3, queue_url: str, message: dict) -> None:
 
     s3_info = records[0]["s3"]
     bucket = s3_info["bucket"]["name"]
-    key = s3_info["object"]["key"]
+    # S3 event keys are URL-encoded (spaces as "+", etc.) - decode before use,
+    # or GetObject fails to find any key needing escaping.
+    key = unquote_plus(s3_info["object"]["key"])
 
     try:
         obj = s3.get_object(Bucket=bucket, Key=key)
         raw = obj["Body"].read().decode("utf-8", errors="replace")
-    except (BotoCoreError, ClientError) as exc:
-        repository.record_validation_failure(key, "s3", "", f"could not fetch S3 object: {exc}")
-        conversations_processed_total.labels(outcome="failed").inc()
-        sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=receipt_handle)
+    except (BotoCoreError, ClientError):
+        # Transient (network/service issue, not the object's fault) - leave
+        # the message for standard SQS redelivery/DLQ. No conversation_id
+        # exists yet to record anything against; DLQ depth is the signal.
         return
 
     try:

@@ -1,9 +1,9 @@
 from openai import OpenAI
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from tenacity import retry, stop_after_attempt, wait_random_exponential
 
 from app import config
-from app.scoring.base import PROMPT_VERSION, ScoreResult
+from app.scoring.base import PROMPT_VERSION, ScoreResult, Sentiment
 from app.scoring.cost import estimate_cost_usd
 from app.scoring.fake import TRANSIENT_FAIL_MARKER
 
@@ -17,10 +17,12 @@ _SYSTEM_PROMPT = (
 class _LLMResponse(BaseModel):
     """The schema the model itself fills in - deliberately narrower than
     ScoreResult, which also carries model/tokens/cost filled in by this module
-    after the call, not by the LLM."""
+    after the call, not by the LLM. Constraints here (Literal, ge/le) are
+    encoded into the structured-output JSON schema itself, not just checked
+    after the fact."""
 
-    sentiment: str
-    risk_score: float
+    sentiment: Sentiment
+    risk_score: float = Field(ge=0.0, le=1.0)
     rationale: str
 
 

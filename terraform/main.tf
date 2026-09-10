@@ -102,13 +102,21 @@ resource "aws_iam_policy" "worker_process" {
         Resource = "${aws_s3_bucket.conversations.arn}/incoming/*"
       },
       {
+        # ChangeMessageVisibility deliberately excluded - the worker relies
+        # on natural visibility-timeout expiry (see DECISIONS.md), it never
+        # calls this API. GetQueueUrl is separate from the queue's own ARN
+        # scope (it's a resolve-by-name call), so it needs its own statement.
         Effect = "Allow"
         Action = [
           "sqs:ReceiveMessage",
           "sqs:DeleteMessage",
-          "sqs:ChangeMessageVisibility",
           "sqs:GetQueueAttributes",
         ]
+        Resource = aws_sqs_queue.processing.arn
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["sqs:GetQueueUrl"]
         Resource = aws_sqs_queue.processing.arn
       },
     ]

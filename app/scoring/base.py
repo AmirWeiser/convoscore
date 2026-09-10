@@ -1,12 +1,14 @@
-from typing import Protocol
+from typing import Literal, Protocol
 
 from pydantic import BaseModel, Field
 
 PROMPT_VERSION = "v1"
 
+Sentiment = Literal["positive", "neutral", "negative"]
+
 
 class ScoreResult(BaseModel):
-    sentiment: str = Field(description="One of: positive, neutral, negative")
+    sentiment: Sentiment
     risk_score: float = Field(ge=0.0, le=1.0, description="0 = no risk, 1 = high risk")
     rationale: str
     model: str

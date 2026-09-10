@@ -11,8 +11,14 @@ __pycache__/
 .venv/
 venv/
 
-# Secrets - never committed, created out-of-band by scripts/
+# Secrets - never committed, created out-of-band by scripts/. Broad patterns
+# on purpose after an earlier incident where a stray notepad save
+# (ConvoScore.env, ConvoScore.env.txt) landed outside the original narrow
+# ".env" rule - see DECISIONS.md.
 .env
+*.env
+*.env.txt
+!.env.example
 *.local.yaml
 secrets/
 
