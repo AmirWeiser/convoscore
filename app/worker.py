@@ -136,9 +136,45 @@ def _process_message(sqs, s3, queue_url: str, message: dict) -> None:
     conversation_id = repository.upsert_pending_for_ingestion(key, "s3", text)
 
     if not repository.claim_for_processing(conversation_id, config.VISIBILITY_TIMEOUT_SECONDS):
-        # Already completed/failed, or another in-flight delivery currently
-        # owns it - safe no-op.
-        sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=receipt_handle)
+        # SQS visibility starts at receipt time, but processing_started_at is
+        # only written afterwards (after the S3 GetObject + DB round trip
+        # above) - the two clocks are not synchronized even though they use
+        # the same timeout value. A genuine SQS redelivery/duplicate can
+        # therefore arrive while the row is still legitimately owned by
+        # another in-flight delivery and NOT YET stale by the DB's own
+        # clock. Unconditionally deleting this message in that case discards
+        # the only remaining SQS copy of a conversation that hasn't actually
+        # finished - if the owning attempt then crashes, nothing is left to
+        # redeliver or reclaim it, and the row is stuck 'processing' forever.
+        # Only a genuinely terminal row (completed, or permanently/
+        # transiently failed) makes this message a safe-to-drop duplicate.
+        # See DECISIONS.md.
+        status = repository.get_status(conversation_id)
+        if status in ("completed", "failed"):
+            logger.info(
+                "duplicate delivery for a terminal conversation - deleting",
+                extra={
+                    "conversation_id": str(conversation_id),
+                    "source_key": key,
+                    "status": status,
+                    "receive_count": receive_count,
+                },
+            )
+            sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=receipt_handle)
+        else:
+            # 'processing' (not yet stale), or a same-moment 'pending' race -
+            # another delivery owns or is about to own this claim. Leave the
+            # message undeleted: standard SQS redelivery/the stale-reclaim
+            # window is what resolves this, not this delivery deleting it.
+            logger.info(
+                "claim skipped - conversation still owned by another in-flight delivery, leaving message for redelivery",
+                extra={
+                    "conversation_id": str(conversation_id),
+                    "source_key": key,
+                    "status": status,
+                    "receive_count": receive_count,
+                },
+            )
         return
 
     start = time.monotonic()

@@ -154,13 +154,11 @@ echo "after:  $AFTER_SNAPSHOT"
 if [ "$BEFORE_SNAPSHOT" = "$AFTER_SNAPSHOT" ]; then
   echo "CONFIRMED: the exact result (including completed_at) survived unchanged - not re-processed."
 else
-  echo "NOTE: the result differs after the restart - this means the conversation was re-scored"
-  echo "(a new completed_at and/or different result fields), not that data was lost. This can happen"
-  echo "if the Postgres pod deletion interrupts an in-flight SQS delivery before the DB commit lands:"
-  echo "the message stays undelivered and is retried, causing one extra real scoring pass. It should"
-  echo "NOT happen if the commit already landed before the interruption - claim_for_processing must"
-  echo "reject a redelivery against an already-'completed' row. Treat this as a finding to look into,"
-  echo "not an expected outcome."
+  echo "FAILED: the result differs after the restart - this means the conversation was re-scored" >&2
+  echo "(a new completed_at and/or different result fields), not that the original result was proven" >&2
+  echo "to survive. A passing run must show byte-for-byte identical rows; treat this as a real finding" >&2
+  echo "to investigate (e.g. app/worker.py's claim-vs-delete handling), not an expected outcome." >&2
+  exit 1
 fi
 
 echo ""
