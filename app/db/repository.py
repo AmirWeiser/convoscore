@@ -112,18 +112,21 @@ def claim_for_processing(conversation_id: uuid.UUID, visibility_timeout_seconds:
         return cur.rowcount == 1
 
 
-def get_status(conversation_id: uuid.UUID) -> str | None:
-    """Used only to explain *why* a claim failed - a terminal row
-    (completed/failed) vs. one genuinely still owned by another in-flight
-    delivery (processing, not yet stale). See DECISIONS.md and worker.py:
-    a failed claim must never be treated as "safe to delete the message"
-    without checking which of these it actually is."""
+def get_claim_conflict_info(conversation_id: uuid.UUID) -> dict[str, Any] | None:
+    """Used only to explain *why* a claim failed, with enough detail to
+    decide whether deleting the message is safe: status alone is not
+    enough, since 'failed' covers two very different cases - permanently
+    invalid input (a duplicate is safe to delete) and a transient-retry
+    exhaustion whose message must be left alone for SQS's own redrive
+    policy to move to the DLQ (deleting it here would do that ourselves,
+    outside the redrive policy, and skip the DLQ). See DECISIONS.md and
+    worker.py."""
     with pool.connection() as conn:
         conn.row_factory = dict_row
-        row = conn.execute(
-            "SELECT status FROM conversations WHERE id = %s", (conversation_id,)
+        return conn.execute(
+            "SELECT status, error_category FROM conversations WHERE id = %s",
+            (conversation_id,),
         ).fetchone()
-        return row["status"] if row else None
 
 
 def store_result(conversation_id: uuid.UUID, result: Any) -> None:

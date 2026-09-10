@@ -95,11 +95,59 @@ def test_recovery_after_original_claim_goes_stale(monkeypatch):
     assert row["status"] == "completed"
 
 
-def test_duplicate_delivery_for_a_terminal_conversation_is_still_deleted():
+def test_duplicate_delivery_for_a_completed_conversation_is_still_deleted():
     """Distinguishing busy-from-terminal must not regress the existing,
     correct cleanup of duplicates for conversations that are genuinely done."""
     conversation_id = uuid.uuid4()
-    key = f"incoming/{conversation_id}-terminal-test.json"
+    key = f"incoming/{conversation_id}-completed-test.json"
+    repository.create_pending(conversation_id, key, "s3", "irrelevant test text")
+    assert repository.claim_for_processing(conversation_id, visibility_timeout_seconds=60) is True
+
+    class _FakeResult:
+        sentiment, risk_score, rationale = "neutral", 0.1, "test"
+        model, prompt_version = "fake", "v1"
+        input_tokens, output_tokens, estimated_cost_usd = 1, 1, 0.0
+
+    repository.store_result(conversation_id, _FakeResult())
+
+    sqs = MagicMock()
+    worker_module._process_message(sqs, _s3_mock(), "fake-queue-url", _s3_event_message(key, 2))
+
+    sqs.delete_message.assert_called_once()
+
+
+def test_duplicate_delivery_for_a_validation_failure_is_still_deleted():
+    """A validation failure is permanently done (never retried, never DLQ'd
+    in the first place) - a duplicate for it is safe to delete, same as a
+    completed row."""
+    conversation_id = uuid.uuid4()
+    key = f"incoming/{conversation_id}-validation-test.json"
+    repository.create_pending(conversation_id, key, "s3", "irrelevant test text")
+    assert repository.claim_for_processing(conversation_id, visibility_timeout_seconds=60) is True
+    repository.mark_failed(conversation_id, "validation", "ValueError")
+
+    sqs = MagicMock()
+    worker_module._process_message(sqs, _s3_mock(), "fake-queue-url", _s3_event_message(key, 2))
+
+    sqs.delete_message.assert_called_once()
+
+
+def test_duplicate_delivery_for_transient_exhausted_does_not_delete_or_score(monkeypatch):
+    """The whole point of transient_exhausted is that SQS's own redrive
+    policy - not this code - moves the message to the DLQ once its own
+    maxReceiveCount is reached. A "duplicate" delivery for that row must
+    neither delete the message (which would remove it from SQS ourselves
+    and skip the DLQ) nor score it again (it's already a terminal outcome)."""
+
+    def _must_not_be_called(_text):
+        raise AssertionError("scorer must not be invoked for a transient_exhausted duplicate")
+
+    scorer = MagicMock()
+    scorer.score.side_effect = _must_not_be_called
+    monkeypatch.setattr(worker_module, "get_scorer", lambda: scorer)
+
+    conversation_id = uuid.uuid4()
+    key = f"incoming/{conversation_id}-transient-exhausted-test.json"
     repository.create_pending(conversation_id, key, "s3", "irrelevant test text")
     assert repository.claim_for_processing(conversation_id, visibility_timeout_seconds=60) is True
     repository.mark_failed(conversation_id, "transient_exhausted", "RuntimeError")
@@ -107,4 +155,12 @@ def test_duplicate_delivery_for_a_terminal_conversation_is_still_deleted():
     sqs = MagicMock()
     worker_module._process_message(sqs, _s3_mock(), "fake-queue-url", _s3_event_message(key, 2))
 
-    sqs.delete_message.assert_called_once()
+    sqs.delete_message.assert_not_called()
+    scorer.score.assert_not_called()
+    with repository.pool.connection() as conn:
+        conn.row_factory = dict_row
+        row = conn.execute(
+            "SELECT status, error_category FROM conversations WHERE id = %s", (conversation_id,)
+        ).fetchone()
+    assert row["status"] == "failed"
+    assert row["error_category"] == "transient_exhausted"

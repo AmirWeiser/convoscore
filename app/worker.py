@@ -146,21 +146,42 @@ def _process_message(sqs, s3, queue_url: str, message: dict) -> None:
         # the only remaining SQS copy of a conversation that hasn't actually
         # finished - if the owning attempt then crashes, nothing is left to
         # redeliver or reclaim it, and the row is stuck 'processing' forever.
-        # Only a genuinely terminal row (completed, or permanently/
-        # transiently failed) makes this message a safe-to-drop duplicate.
-        # See DECISIONS.md.
-        status = repository.get_status(conversation_id)
-        if status in ("completed", "failed"):
+        # Status alone is not enough to decide - 'failed' covers two very
+        # different cases. A validation failure is permanently done, so a
+        # duplicate is safe to delete. A transient_exhausted failure's
+        # message must be left exactly alone: it's already earmarked for
+        # SQS's own redrive policy to move to the DLQ once its own
+        # maxReceiveCount is reached, and deleting it here (even for a
+        # "duplicate" delivery) would remove it from SQS ourselves and skip
+        # the DLQ entirely - the opposite of what this project's failure/DLQ
+        # behavior depends on. See DECISIONS.md.
+        conflict = repository.get_claim_conflict_info(conversation_id)
+        status = conflict["status"] if conflict else None
+        error_category = conflict["error_category"] if conflict else None
+
+        if status == "completed" or (status == "failed" and error_category != "transient_exhausted"):
             logger.info(
                 "duplicate delivery for a terminal conversation - deleting",
                 extra={
                     "conversation_id": str(conversation_id),
                     "source_key": key,
                     "status": status,
+                    "error_category": error_category,
                     "receive_count": receive_count,
                 },
             )
             sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=receipt_handle)
+        elif status == "failed" and error_category == "transient_exhausted":
+            logger.info(
+                "duplicate delivery for a transient_exhausted conversation - leaving message for SQS's own redrive to the DLQ",
+                extra={
+                    "conversation_id": str(conversation_id),
+                    "source_key": key,
+                    "status": status,
+                    "error_category": error_category,
+                    "receive_count": receive_count,
+                },
+            )
         else:
             # 'processing' (not yet stale), or a same-moment 'pending' race -
             # another delivery owns or is about to own this claim. Leave the
