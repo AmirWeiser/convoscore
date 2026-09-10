@@ -24,19 +24,27 @@ data:
   # DECISIONS.md), so nothing routes/pages on these, but a stale worker poll
   # loop or DLQ collector is visible here and on the Grafana dashboard
   # instead of looking identical to "healthy and idle".
+  #
+  # {job="convoscore-worker"} is required, not cosmetic: app/metrics.py is
+  # one module imported by both entrypoints, so the API process also holds
+  # its own (always-zero, never-set) copy of these worker-only gauges. Ohat
+  # That zero, evaluated as time()-0, is a huge number that satisfies ">120"/
+  # ">180" forever - without the job filter both alerts fire permanently on
+  # the API's own meaningless series, a false alarm confirmed live via
+  # /api/v1/alerts before this filter was added.
   alerts.yml: |
     groups:
       - name: convoscore
         rules:
           - alert: ConvoScoreWorkerPollStale
-            expr: time() - convoscore_worker_last_poll_timestamp_seconds > 120
+            expr: time() - convoscore_worker_last_poll_timestamp_seconds{job="convoscore-worker"} > 120
             for: 1m
             labels:
               severity: warning
             annotations:
               summary: "ConvoScore worker has not completed a poll cycle in over 2 minutes"
           - alert: ConvoScoreDlqCollectorStale
-            expr: time() - convoscore_dlq_collector_last_success_timestamp_seconds > 180
+            expr: time() - convoscore_dlq_collector_last_success_timestamp_seconds{job="convoscore-worker"} > 180
             for: 1m
             labels:
               severity: warning

@@ -84,11 +84,11 @@
       },
       "targets": [
         {
-          "expr": "time() - convoscore_worker_last_poll_timestamp_seconds",
+          "expr": "time() - convoscore_worker_last_poll_timestamp_seconds{job=\"convoscore-worker\"}",
           "legendFormat": "since last poll cycle"
         },
         {
-          "expr": "time() - convoscore_dlq_collector_last_success_timestamp_seconds",
+          "expr": "time() - convoscore_dlq_collector_last_success_timestamp_seconds{job=\"convoscore-worker\"}",
           "legendFormat": "since last DLQ collection"
         }
       ]
