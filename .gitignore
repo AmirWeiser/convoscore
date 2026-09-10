@@ -1,0 +1,21 @@
+# Terraform
+terraform/.terraform/
+terraform/*.tfstate
+terraform/*.tfstate.*
+terraform/*.tfplan
+terraform/crash.log
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Secrets - never committed, created out-of-band by scripts/
+.env
+*.local.yaml
+secrets/
+
+# OS/editor
+.DS_Store
+*.swp
