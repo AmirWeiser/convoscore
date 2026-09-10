@@ -8,7 +8,11 @@ from app.config import DATABASE_URL
 # Conservative pool size - see DECISIONS.md. API is request-driven (a handful of
 # concurrent requests at this scale); the worker (added in Phase 4) gets its own,
 # smaller pool since it's a single-threaded poll loop.
-pool = ConnectionPool(DATABASE_URL, min_size=1, max_size=5, open=False)
+# timeout=10: how long a single pool.connection() call waits for an
+# available connection before raising - tightened from the 30s default so a
+# degraded pool fails fast and visibly instead of silently stalling the
+# worker's single-threaded loop. See DECISIONS.md.
+pool = ConnectionPool(DATABASE_URL, min_size=1, max_size=5, open=False, timeout=10)
 
 _SCHEMA_PATH = Path(__file__).parent / "schema.sql"
 

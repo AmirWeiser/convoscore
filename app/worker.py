@@ -98,12 +98,12 @@ def _process_message(sqs, s3, queue_url: str, message: dict) -> None:
 
 
 def main() -> None:
-    # Metrics server opens first, before the blocking DB call - so the
-    # liveness TCP check has something to connect to immediately, instead of
-    # seeing "connection refused" during a slow Postgres cold start and
-    # killing an otherwise-fine, still-starting pod. See DECISIONS.md.
-    start_http_server(config.METRICS_PORT)
+    # init_schema() completes fully before the metrics port opens - the
+    # startupProbe (Helm chart) now provides the startup grace period
+    # instead, so a passing startupProbe genuinely means "has a working DB
+    # connection", not just "process is alive". See DECISIONS.md.
     init_schema()
+    start_http_server(config.METRICS_PORT)
     signal.signal(signal.SIGTERM, _handle_shutdown_signal)
     signal.signal(signal.SIGINT, _handle_shutdown_signal)
 
@@ -115,11 +115,24 @@ def main() -> None:
         response = sqs.receive_message(
             QueueUrl=queue_url,
             WaitTimeSeconds=20,
-            MaxNumberOfMessages=5,
+            # One at a time, not five - found that batching let later
+            # messages in a batch sit waiting their turn in this loop while
+            # an earlier one (bounded, but up to ~40-50s worst case across
+            # S3+scorer+DB calls) was still being handled, eating into their
+            # own visibility-timeout window under bursty submission. See
+            # DECISIONS.md.
+            MaxNumberOfMessages=1,
             AttributeNames=["ApproximateReceiveCount"],
         )
         for message in response.get("Messages", []):
-            _process_message(sqs, s3, queue_url, message)
+            try:
+                _process_message(sqs, s3, queue_url, message)
+            except Exception:
+                # Any unexpected failure (not just the scorer's) must never
+                # silently wedge this loop - see DECISIONS.md. Leave the
+                # message undeleted; standard SQS redelivery/DLQ handles it
+                # like any other transient failure.
+                pass
 
 
 if __name__ == "__main__":

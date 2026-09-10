@@ -22,7 +22,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: worker
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          image: "{{ .Values.image.repository }}:{{ required "image.tag must be passed explicitly (see scripts/deploy.sh) - no default, no latest" .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           command: ["python", "-m", "app.worker"]
           ports:

@@ -1,6 +1,11 @@
 image:
   repository: convoscore
-  tag: "078403d"
+  # No default tag on purpose - a hardcoded tag here would need to be the
+  # SHA of a commit containing this exact line, which is unsolvable
+  # (self-referential). Always supplied at deploy time by
+  # scripts/deploy.sh via --set image.tag=$(git rev-parse --short HEAD) -
+  # the chart enforces this with `required` in the Deployment templates
+  # rather than silently deploying an empty/stale image reference.
   pullPolicy: IfNotPresent
 
 api:
