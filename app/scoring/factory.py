@@ -11,4 +11,9 @@ def get_scorer() -> Scorer:
         from app.scoring.openai_scorer import OpenAIScorer
 
         return OpenAIScorer()
-    return FakeScorer()
+    if config.SCORER_PROVIDER == "fake":
+        return FakeScorer()
+    raise ValueError(
+        f"Unsupported SCORER_PROVIDER: {config.SCORER_PROVIDER!r} "
+        "(expected 'fake' or 'openai') - never silently falls back"
+    )

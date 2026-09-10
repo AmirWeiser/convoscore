@@ -26,8 +26,14 @@ class _LLMResponse(BaseModel):
 
 class OpenAIScorer:
     def __init__(self) -> None:
+        # max_retries=0: the SDK's own built-in retry defaults to 2 (3 total
+        # attempts) at the transport level, which would nest inside the
+        # tenacity retry below - two overlapping retry mechanisms. tenacity is
+        # the single source of truth for attempt count (OPENAI_MAX_RETRIES).
         self._client = OpenAI(
-            api_key=config.OPENAI_API_KEY, timeout=config.OPENAI_TIMEOUT_SECONDS
+            api_key=config.OPENAI_API_KEY,
+            timeout=config.OPENAI_TIMEOUT_SECONDS,
+            max_retries=0,
         )
 
     def score(self, text: str) -> ScoreResult:
