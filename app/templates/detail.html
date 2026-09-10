@@ -1,0 +1,23 @@
+{% extends "_base.html" %}
+{% block title %}Conversation {{ c.id }} - ConvoScore{% endblock %}
+{% block content %}
+<h1>Conversation <code>{{ c.id }}</code></h1>
+<span class="status status-{{ c.status }}">{{ c.status }}</span>
+
+<dl>
+  <div class="field"><dt>Source</dt><dd>{{ c.source }} ({{ c.source_key }})</dd></div>
+  <div class="field"><dt>Content</dt><dd><pre>{{ c.input_text }}</pre></dd></div>
+  <div class="field"><dt>Sentiment</dt><dd>{{ c.sentiment or '-' }}</dd></div>
+  <div class="field"><dt>Risk score</dt><dd>{{ c.risk_score if c.risk_score is not none else '-' }}</dd></div>
+  <div class="field"><dt>Rationale</dt><dd>{{ c.rationale or '-' }}</dd></div>
+  <div class="field"><dt>Model / Prompt version</dt><dd>{{ c.model or '-' }} / {{ c.prompt_version or '-' }}</dd></div>
+  <div class="field"><dt>Tokens (in/out)</dt><dd>{{ c.input_tokens if c.input_tokens is not none else '-' }} / {{ c.output_tokens if c.output_tokens is not none else '-' }}</dd></div>
+  <div class="field"><dt>Estimated cost (USD)</dt><dd>{{ c.estimated_cost_usd if c.estimated_cost_usd is not none else '-' }}</dd></div>
+  <div class="field"><dt>Created</dt><dd>{{ c.created_at.strftime('%Y-%m-%d %H:%M:%S') }}</dd></div>
+  <div class="field"><dt>Processing started</dt><dd>{{ c.processing_started_at.strftime('%Y-%m-%d %H:%M:%S') if c.processing_started_at else '-' }}</dd></div>
+  <div class="field"><dt>Completed</dt><dd>{{ c.completed_at.strftime('%Y-%m-%d %H:%M:%S') if c.completed_at else '-' }}</dd></div>
+  {% if c.status == 'failed' %}
+  <div class="field"><dt>Failure ({{ c.error_category }})</dt><dd>{{ c.error_message or '-' }}</dd></div>
+  {% endif %}
+</dl>
+{% endblock %}

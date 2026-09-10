@@ -1,0 +1,24 @@
+{% extends "_base.html" %}
+{% block title %}Conversations - ConvoScore{% endblock %}
+{% block content %}
+<h1>Conversations</h1>
+<table>
+  <thead>
+    <tr><th>ID</th><th>Source</th><th>Status</th><th>Sentiment</th><th>Risk</th><th>Created</th></tr>
+  </thead>
+  <tbody>
+    {% for c in conversations %}
+    <tr>
+      <td><a href="/conversations/{{ c.id }}">{{ c.id|string|truncate(8, True, '') }}</a></td>
+      <td>{{ c.source }}</td>
+      <td><span class="status status-{{ c.status }}">{{ c.status }}</span></td>
+      <td>{{ c.sentiment or '-' }}</td>
+      <td>{{ c.risk_score if c.risk_score is not none else '-' }}</td>
+      <td>{{ c.created_at.strftime('%Y-%m-%d %H:%M:%S') }}</td>
+    </tr>
+    {% else %}
+    <tr><td colspan="6">No conversations yet.</td></tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endblock %}
