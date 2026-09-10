@@ -37,12 +37,15 @@ app.mount("/metrics", make_asgi_app())
 class _MetricsMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         start = time.monotonic()
-        # Route template (e.g. "/conversations/{conversation_id}"), never the
-        # resolved path - a resolved path would put a fresh UUID in a label
-        # value per request, the exact unbounded-cardinality mistake this
-        # project avoids elsewhere. See DECISIONS.md.
-        route = request.scope.get("route")
-        path = route.path if route else "unmatched"
+        # request.scope["route"] is only populated once Starlette's router
+        # has matched the request - which happens *inside* call_next (this
+        # middleware sits outside the router in the ASGI chain). Reading it
+        # before call_next() always sees an unmatched scope, so every
+        # request - including normal, successfully-routed ones - was mislabeled
+        # "unmatched". It must be read after call_next() returns or raises,
+        # by which point the router has already mutated the shared scope
+        # dict (mutated in place, even on a downstream exception, as long as
+        # routing itself succeeded). See DECISIONS.md.
         try:
             response = await call_next(request)
         except Exception:
@@ -52,10 +55,14 @@ class _MetricsMiddleware(BaseHTTPMiddleware):
             # error handling still produces the real response. See
             # DECISIONS.md.
             duration = time.monotonic() - start
+            route = request.scope.get("route")
+            path = route.path if route else "unmatched"
             http_requests_total.labels(request.method, path, "500").inc()
             http_request_duration_seconds.labels(request.method, path).observe(duration)
             raise
         duration = time.monotonic() - start
+        route = request.scope.get("route")
+        path = route.path if route else "unmatched"
         http_requests_total.labels(request.method, path, str(response.status_code)).inc()
         http_request_duration_seconds.labels(request.method, path).observe(duration)
         return response
