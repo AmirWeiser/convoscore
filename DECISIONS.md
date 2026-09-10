@@ -11,178 +11,183 @@ Direct ┘
 S3 upload
 ```
 
-Both ingestion paths converge on the same pipeline. The API never calls OpenAI directly:
-it validates the request, inserts a `pending` row, writes the conversation to S3, and
-returns `202`. A direct S3 upload (bypassing the API entirely) reaches the same worker
-through the same S3 `ObjectCreated` → SQS notification, so there is exactly one scoring
-code path regardless of how a conversation entered the system.
+**Both ingestion paths converge through S3 and SQS** so there is exactly one scoring
+code path regardless of how a conversation entered the system - the worker cannot tell
+(and does not need to) whether a given S3 object was written by the API or uploaded
+directly. The API never calls OpenAI itself: it validates the request, inserts a
+`pending` row, writes the conversation to S3, and returns `202`.
 
-Terraform (against LocalStack) provisions the S3 bucket, the processing queue, its DLQ,
-the bucket notification, and IAM policies describing the intended least-privilege shape
-(LocalStack Community doesn't enforce IAM at the API-call level, so these exist to show
-the real-AWS shape, not to actually restrict access here). Helm deploys the app,
-Postgres, Prometheus, and Grafana to Kubernetes (minikube). Secrets are created
-out-of-band by `scripts/k8s-secrets.sh` and only ever referenced by name from the chart
-- never templated into it, never committed.
+**Processing is asynchronous, and SQS exists alongside S3** because S3 alone only
+offers "an object was written," not a durable, retryable, at-least-once work queue with
+visibility timeouts and a dead-letter destination. Scoring calls an external LLM with
+non-trivial, variable latency; doing that synchronously inside the API request would
+tie request latency to OpenAI's, and a slow/failing OpenAI call would have no clean
+retry story. SQS's S3 event notification gives a queue "for free" on top of the S3
+write the API already needs to make (for direct uploads to work at all).
+
+**PostgreSQL** was chosen over a NoSQL store because the domain is a single, simple,
+strongly-typed record type queried by a handful of fixed shapes (recent list, by id,
+claim-by-status) - relational + `CHECK` constraints for the state machine's legality is
+a better fit than a schemaless store bought for scale this project doesn't have.
+Pod-restart durability is proven by `scripts/demo-restart.sh`: it captures a completed
+row's full result (including `completed_at`) before deleting the Postgres pod, and
+after the StatefulSet recreates it against the **same PVC**, asserts the row is
+byte-for-byte identical - not just "status is completed again," which a re-scored
+duplicate would also show.
 
 ## State machine
 
 `pending → processing → completed` (terminal), or `→ failed` (terminal) with an
-`error_category` of `validation` or `transient_exhausted`.
+`error_category` of `validation`, `transient_exhausted`, or `enqueue_failed`.
 
-- **Validation failure**: malformed input (bad JSON, missing/empty `text`). Terminal
-  immediately, the SQS message is deleted right away, and it never reaches the DLQ -
-  retrying a well-formed rejection of malformed input would never succeed differently.
-- **Transient failure**: a scoring attempt raised (network blip, rate limit, the
-  deterministic `__TRANSIENT_FAIL__` demo marker). The message is left undeleted for
-  standard SQS redelivery. On the attempt where `ApproximateReceiveCount` reaches the
-  configured `maxReceiveCount`, the worker marks the row `failed`/`transient_exhausted`
-  and *still* leaves the message undeleted - SQS's own redrive policy, not this code,
-  is what moves it to the DLQ.
-- `completed` and `failed` are both terminal and never reclaimed.
+- **Validation failure**: malformed input (bad JSON, missing/empty/non-string/
+  whitespace-only/over-length `text`) - both ingestion paths validate through the same
+  `ConversationIn` Pydantic model. Terminal immediately, the SQS message is deleted
+  right away, never reaches the DLQ.
+- **Transient failure**: a scoring attempt raised. The message is left undeleted for
+  standard SQS redelivery. On the attempt where `ApproximateReceiveCount` reaches
+  `maxReceiveCount`, the worker marks the row `failed`/`transient_exhausted` and *still*
+  leaves the message undeleted - SQS's own redrive policy, not this code, moves it to
+  the DLQ.
+- **Enqueue failure**: the API's `PutObject` raised *and* a follow-up `HeadObject`
+  definitively confirmed the object was never stored (see "Ambiguous enqueue" below).
 
-## Idempotency: source_key, stale-reclaim, and the claim/delete fix
+## Idempotency, at-least-once delivery, and claim fencing
 
-`source_key` (the S3 object key) is the idempotency anchor - a `UNIQUE` constraint,
-upserted with `ON CONFLICT DO NOTHING` so a direct-S3 upload and an API submission for
-the same key never produce two rows, and so a genuine SQS duplicate delivery finds the
-same row rather than creating a second one.
+SQS is at-least-once, never exactly-once, and an OpenAI call cannot be made atomic with
+the database commit that records its result - two real consequences follow directly
+from that, and neither is eliminated, only bounded:
 
-A worker claims a row for processing with:
+- **A duplicate message for an already-decided row must not re-decide it.**
+  `source_key` (the S3 object key) is the idempotency anchor - `UNIQUE`, upserted with
+  `ON CONFLICT DO NOTHING` - so a duplicate delivery finds the same row instead of
+  creating a second one, and a duplicate validation-failure write can never downgrade an
+  already-completed or already-processing row.
+- **Claim fencing prevents an older attempt from overwriting a newer one.** A worker
+  claims a row with a fresh `processing_token` (`UPDATE ... WHERE status='pending' OR
+  (status='processing' AND processing_started_at < now() - visibility_timeout)`, the
+  same staleness threshold as the SQS queue's own `VisibilityTimeout` - one number, two
+  places, by design). `store_result`/`mark_failed` are guarded by `WHERE id=%s AND
+  status='processing' AND processing_token=%s`: if a stale-reclaim has since taken the
+  row, the older attempt's guarded write affects zero rows ("superseded") and must not
+  be treated as success - it re-reads the row's current authoritative state instead of
+  assuming one, and never deletes the only remaining SQS copy of a row that hasn't
+  actually finished (that exact bug - "a failed claim always means safe to delete" -
+  shipped once and was fixed; the regression test for it must never go red again).
+- **The remaining window: a duplicate paid OpenAI call.** If a worker crashes *after*
+  OpenAI returns a result but *before* the guarded `store_result` commits, the row is
+  still `processing`, will eventually go stale, and a later delivery will call OpenAI
+  again. This is inherent to "SQS is at-least-once and an OpenAI call can't be atomic
+  with a DB commit" - not a bug, and not fully eliminated by anything in this project.
+  A transactional outbox or idempotency-keyed LLM call would close it; out of scope for
+  this take-home (see "Deliberately left out").
+- **A single SQS message can carry more than one S3 record.** Every record in a message
+  is processed independently through the same per-record path; the message is deleted
+  only when *every* record reached a safe, terminal outcome - a partial delete would
+  silently lose whichever record wasn't actually done.
 
-```sql
-UPDATE conversations SET status='processing', processing_started_at=now()
-WHERE id = %s AND (
-  status = 'pending'
-  OR (status = 'processing' AND processing_started_at < now() - (:visibility_timeout seconds))
-)
-```
+### Ambiguous enqueue
 
-The staleness threshold is the same number as the SQS queue's `VisibilityTimeout`
-(`VISIBILITY_TIMEOUT_SECONDS` / `terraform/variables.tf`'s `visibility_timeout_seconds`)
-- one value, two places, kept in sync deliberately: a crashed worker's claim should go
-stale at roughly the same time SQS would redeliver the message anyway.
+The API's `PutObject` can raise for reasons that don't prove S3 never stored the
+object (a timeout can mean S3 accepted it and emitted a notification while the client
+never saw the response). An unconditional compensating delete on any exception would
+risk erasing a conversation the worker is about to process. Instead: on a `PutObject`
+exception, a bounded `HeadObject` check decides - object exists → treat as accepted
+(202); a definitive not-found → record a visible `enqueue_failed` row (never a hard
+delete) and return `502`; the check itself inconclusive → leave the row visibly
+`pending` and return a retryable `503`. A production system would replace this with a
+transactional outbox or a dedicated reconciler; that's deliberately not built here (see
+"Deliberately left out").
 
-**A real bug was found and fixed in this claim logic** (2026-09-10, commits `421fa5a` and
-`fcbbbd4`). The original code treated *any* failed claim as "safe to delete the SQS
-message" - but a failed claim has three different causes, and only some of them make the
-message a safe-to-drop duplicate:
+## Timeouts and retries
 
-| Row state when the claim fails | Message action |
-|---|---|
-| `completed`, or `failed`/`validation` | **Delete** - genuinely done, a duplicate is noise |
-| `failed`/`transient_exhausted` | **Leave alone** - already earmarked for SQS's own redrive to the DLQ; deleting it here would remove it from SQS ourselves and skip the DLQ |
-| `processing` and **not yet stale** - another delivery is still legitimately working on it | **Leave alone** |
+- **boto3 clients**: 10s connect / 30s read (not tighter - SQS long-polling uses
+  `WaitTimeSeconds=20`, and the read timeout must stay comfortably above that).
+- **DB pool**: 10s to acquire a pooled connection; `pool.open(wait=True, timeout=30)`
+  called exactly once at startup, never retried (`ConnectionPool.open()` is a one-shot
+  lifecycle transition - retrying it raises `PoolClosed`, it does not retry the open).
+  If that one call fails, the process exits and Kubernetes' `restartPolicy` plus the
+  chart's generous `startupProbe` grace period is the actual recovery mechanism.
+- **OpenAI**: `OPENAI_TIMEOUT_SECONDS` (20s default) per call, `tenacity`-driven retries
+  (`OPENAI_MAX_RETRIES`, default 3) with random exponential backoff; the SDK's own
+  built-in retries are disabled (`max_retries=0`) so there's exactly one retry
+  mechanism, not two nested ones.
+- **SQS redelivery**: governed by `VisibilityTimeoutSeconds` (60s) and `maxReceiveCount`
+  (3), matched by `VISIBILITY_TIMEOUT_SECONDS`/`MAX_RECEIVE_COUNT` in the app - the same
+  numbers in Terraform and in the app config, not independently chosen.
 
-The busy case is the subtle one: SQS's visibility clock starts at message *receipt*, but
-`processing_started_at` is only written after the S3 `GetObject` + DB round trip that
-follows receipt - the two clocks use the same timeout value but are not synchronized. A
-genuine SQS redelivery can arrive in that gap, see a row that's `processing` but not yet
-stale by the DB's clock, and - under the old code - have its message deleted
-unconditionally. That deletion discarded the *only remaining SQS copy* of a conversation
-that hadn't actually finished; if the owning attempt then crashed before completing,
-nothing was left to redeliver or reclaim it, and the row was stuck `processing`
-permanently. This is what actually caused conversations to vanish during restart-demo
-testing - see **Correction: the LocalStack misattribution**, below.
+## Secrets and least privilege
 
-The fix (`repository.get_claim_conflict_info`, `app/worker.py`) looks up `status` *and*
-`error_category` before deciding, logs which of the three cases it hit (so a future
-disappearance can be traced from the logs alone), and only deletes in the two genuinely
-terminal-and-safe cases. `tests/test_redelivery_no_delete.py` reproduces the busy-claim
-race deterministically (backdating `processing_started_at` instead of sleeping) and
-asserts recovery still works once the original claim genuinely goes stale.
-
-## Correction: the LocalStack misattribution
-
-While investigating conversations vanishing mid-retry during restart-demo testing, an
-earlier pass concluded LocalStack's SQS emulation was unreliable under sustained use and
-documented it that way. That conclusion was wrong and has been retracted: the actual
-cause was the application-level bug described above. Once fixed, the same restart and
-DLQ demos were re-run repeatedly against the same LocalStack instance without
-recurrence. LocalStack is not a known source of message loss in this project; it was a
-suspicion that didn't survive ruling out the real cause.
-
-## Docker image and deployment
-
-One image, two entrypoints: `python -m uvicorn app.main:app` (API) and
-`python -m app.worker` (worker) - no `ENTRYPOINT` lock-in, so the Helm chart's two
-Deployments just override `command`. Multi-stage `Dockerfile` (builder installs
-dependencies into a venv; the runtime stage copies only the venv and `app/`, never git
-metadata, tests, or Terraform state), non-root `appuser` (uid 1000), `python:3.14-slim`
-to match local dev.
-
-`values.yaml` deliberately has **no default image tag** - a hardcoded tag would need to
-be the SHA of a commit containing that exact line, which is self-referential and
-unsolvable. `scripts/deploy.sh` always supplies `--set image.tag=$(git rev-parse
---short HEAD)`, and both Deployment templates use Helm's `required` function so an
-un-tagged deploy fails loudly instead of silently reusing whatever was last set.
+Kubernetes Secrets (`convoscore-openai`, `convoscore-postgres`) are created out-of-band
+by `scripts/k8s-secrets.sh` - never templated into the Helm chart, never committed.
+`POSTGRES_PASSWORD` has no fixed fallback: if unset, a strong random value is generated
+once and persisted only in the gitignored `.env`, and the connection string
+percent-encodes it so URI-reserved characters can't produce a malformed
+`DATABASE_URL`. The API never receives `OPENAI_API_KEY` at all (it never calls OpenAI).
+Terraform's IAM policies describe the intended least-privilege shape per component -
+the API can `PutObject` only under `incoming/*`; the worker can `GetObject` under
+`incoming/*`, `ReceiveMessage`/`DeleteMessage`/`GetQueueAttributes` only on the
+processing queue's own ARN, and `GetQueueUrl`/`GetQueueAttributes` only on the DLQ's own
+ARN (not the processing queue's broader grant, and no wildcard resources) - but
+**LocalStack Community does not enforce IAM at the API-call level**, so these exist to
+show the real-AWS shape, not to actually restrict access in this environment.
 
 ## Observability
 
-- **Metrics** (`prometheus_client`): `conversations_processed_total{outcome}`,
-  `processing_duration_seconds`, `openai_tokens_total{direction}`,
-  `openai_estimated_cost_usd_total`, `convoscore_dlq_depth` (a worker background thread
-  polls the DLQ's `ApproximateNumberOfMessages` every 30s), and API-side
-  `http_requests_total{method,path,status}` / `http_request_duration_seconds`. `path` is
-  always the route *template* (e.g. `/conversations/{conversation_id}`), never the
-  resolved path - a resolved path would put a fresh UUID in a label value on every
-  request, exactly the unbounded-cardinality mistake this project avoids elsewhere. This
-  requires reading `request.scope["route"]` *after* `call_next()` returns - Starlette's
-  router only populates it once request handling reaches the router, which happens
-  inside `call_next()` since the metrics middleware sits outside it in the ASGI chain.
-  An earlier version read it before `call_next()` and mislabeled every request
-  `"unmatched"`; fixed and covered by `tests/test_metrics_route_labels.py`.
-- **Logs**: structured JSON (`app/logging_setup.py`), stdout only. Only low-cardinality,
-  non-secret fields are ever attached (ids, categories, counts, receive counts). No
-  exception's own message or `str(exc)` is ever logged for a third-party call (OpenAI,
-  boto3, psycopg) - only `type(exc).__name__` plus a message-stripped stack trace
-  (`traceback.format_tb()`, frames only) - because a third-party exception's message can
-  echo back request content (an OpenAI refusal's own explanation text was found to do
-  exactly this during Phase 9 and was fixed to exclude it). Verified by
-  `tests/test_no_sensitive_data_in_logs.py`, which pushes synthetic secret/content
-  markers through the real failure path and asserts they appear nowhere in any log
-  record or DB column.
-- **Prometheus** is a plain Deployment with a static `scrape_configs` ConfigMap,
-  deliberately not the Prometheus Operator/ServiceMonitor CRDs - unnecessary complexity
-  for one Kubernetes-native scrape target set that never changes shape.
-- **Grafana** has one dashboard (processing rate, failure/DLQ depth, latency p95, OpenAI
-  token usage & cost) and anonymous admin access - a documented tradeoff for a
-  single-viewer local demo, not something to carry into a real deployment (see
-  **Limitations**).
+- **Metrics** (`prometheus_client`): conversion outcomes, processing/HTTP latency,
+  OpenAI token usage and estimated cost (a hardcoded per-model pricing table - an
+  estimate, not a billing source of truth), DLQ depth, and two health gauges that make
+  the worker honest: `convoscore_worker_last_poll_timestamp_seconds` (set after every
+  poll cycle, including empty ones - a bare TCP liveness check on the metrics port only
+  proves the process is alive, not that the loop is making progress) and
+  `convoscore_dlq_collector_last_success_timestamp_seconds` (so a stopped DLQ collector
+  can't silently look identical to a genuinely empty DLQ). Kubernetes liveness still
+  checks the process/metrics socket; Prometheus is what actually detects a wedged loop.
+- **Logs**: structured JSON, stdout only, low-cardinality/non-secret fields exclusively.
+  No exception's own message or `str(exc)` is ever logged for a third-party call or
+  through the global formatter - only the type name plus stack frames. An OpenAI
+  refusal's own explanation text was found to be able to echo back flagged input and is
+  excluded on the same principle.
+- **What an on-call engineer would watch**: `convoscore_dlq_depth` rising (something is
+  failing repeatedly), the worker/DLQ-collector staleness gauges (the loop or the
+  collector has stopped, not just "quiet"), `http_requests_total{status="5xx"}` rate,
+  and `openai_estimated_cost_usd_total`'s rate of change (a runaway cost signal).
 
-## AWS clients and the DB pool
+## Deliberately left out (right-sizing this take-home)
 
-Both `boto3` clients and the Postgres pool use short, explicit timeouts
-(`app/aws_clients.py`: 10s connect / 30s read; `app/db/pool.py`: 10s to acquire a pooled
-connection) instead of the libraries' own defaults (boto3's default 60s/60s, an
-unbounded pool wait) - the worker is a single-threaded poll loop with nothing else to
-detect a stall (a bare TCP liveness check on the metrics port stays "up" regardless), so
-a slow dependency needs to fail fast and visibly rather than silently wedge it.
+CI, a service mesh, Argo CD, Vault, a message-broker replacement for SQS, a new web
+framework, an ORM, autoscaling, a transactional outbox/reconciler for the ambiguous-
+enqueue window, and a broad test suite beyond focused regression coverage for the
+behaviors above. Prometheus is a plain static-scrape Deployment, not the Prometheus
+Operator - unnecessary complexity for one fixed scrape target set. No Alertmanager -
+the two alerting rules are visible in Prometheus's own `/alerts` and on the Grafana
+dashboard, nothing routes or pages on them.
 
-`pool.open(wait=True, timeout=30)` is called exactly once at startup, never retried -
-`ConnectionPool.open()` is a one-shot lifecycle transition; calling it again after a
-failed attempt raises `PoolClosed`, it does not retry the open. If the one call still
-fails (e.g. CoreDNS not yet warm on a fresh pod), the process exits and Kubernetes'
-`restartPolicy` plus the chart's `startupProbe` grace period is the actual recovery
-mechanism - the same self-healing pattern used elsewhere in this design rather than
-hand-rolled retry logic.
+## What would change in production
 
-## Known limitations
+Managed database and queue/storage services (RDS/ElastiCache, real SQS/S3) instead of
+a self-hosted Postgres pod and LocalStack; workload identity (IRSA or equivalent)
+instead of static `test`/`test` AWS credentials; an external secret manager instead of
+manually-created Kubernetes Secrets; authenticated Grafana with real users/roles instead
+of anonymous viewer access; high availability (multiple API/worker replicas, a real HA
+Postgres topology) instead of one replica each; a real migration tool instead of one
+idempotent `schema.sql`; autoscaling (HPA on the worker, tied to queue depth); alert
+routing to an on-call system (Alertmanager/PagerDuty) instead of Prometheus-only
+visibility; persistent Prometheus/Grafana storage (`emptyDir` today - metrics and
+dashboards do not survive pod recreation); backups (Postgres snapshots, S3 versioning);
+TLS/Ingress instead of plain `kubectl port-forward`; retention/privacy controls for
+conversation content; and stronger reconciliation semantics for the ambiguous-enqueue
+window (a transactional outbox, or an idempotency-keyed OpenAI call) to close the
+remaining duplicate-call gap described above.
 
-- **Grafana anonymous admin access** - fine for a local, single-viewer demo; a real
-  deployment would need real auth.
-- **OpenAI pricing is a hardcoded estimate** (`app/scoring/cost.py`), not fetched from a
-  billing API - documented as an estimate, not a source of truth.
-- **No exactly-once processing guarantee** beyond what's described above: the
-  claim/delete logic prevents *data loss and premature DLQ bypass*, but a genuine SQS
-  duplicate arriving while a row is legitimately busy is deliberately just left alone for
-  the owning delivery (or a later stale-reclaim) to resolve - it is not actively
-  deduplicated beyond the `source_key` UNIQUE constraint and the claim check.
-- **Restart durability is proven at the pod level only** - `scripts/demo-restart.sh`
-  deletes and recreates the API/worker/Postgres pods and confirms the stored result
-  survives unchanged via the Postgres PVC. It does not prove survival of `minikube
-  delete`, a full cluster teardown, or the underlying PVC's backing volume being lost -
-  the PVC only survives as long as that volume does.
-- **LocalStack is a local AWS emulator, not real AWS** - IAM policies in
-  `terraform/main.tf` describe the intended least-privilege shape but are not enforced
-  by LocalStack Community edition in this environment.
+## Remaining truths, stated plainly
+
+- A crash after OpenAI returns but before the guarded database commit can cause another
+  paid OpenAI call for the same conversation (see "claim fencing" above).
+- Prometheus and Grafana data use `emptyDir` and do not survive pod recreation.
+- LocalStack Community does not enforce the IAM policies Terraform defines.
+- Pod-restart durability is demonstrated (`scripts/demo-restart.sh`); full cluster
+  deletion or LocalStack-volume-loss durability is not, and isn't claimed to be.
+- Cost values are estimates from a hardcoded pricing table, not a billing API.
+- This project does not claim exactly-once processing anywhere, and none of the
+  guarantees above should be read as one.

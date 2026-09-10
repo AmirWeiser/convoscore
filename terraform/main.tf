@@ -29,6 +29,11 @@ provider "aws" {
 
 resource "aws_s3_bucket" "conversations" {
   bucket = var.bucket_name
+  # LocalStack-only local demo bucket - force_destroy lets `terraform
+  # destroy` remove it even with demo conversation objects still inside,
+  # instead of failing with BucketNotEmpty. Never do this for a real bucket
+  # holding data that must not be accidentally destroyed. See DECISIONS.md.
+  force_destroy = true
 }
 
 resource "aws_sqs_queue" "dlq" {
@@ -118,6 +123,16 @@ resource "aws_iam_policy" "worker_process" {
         Effect   = "Allow"
         Action   = ["sqs:GetQueueUrl"]
         Resource = aws_sqs_queue.processing.arn
+      },
+      {
+        # The worker's DLQ-depth gauge (see worker.py) only ever resolves
+        # the DLQ's URL and reads its attributes - it never receives from or
+        # deletes on the DLQ, so this is scoped to exactly those two actions
+        # on the DLQ's own ARN, not the processing queue's broader grant
+        # above and not a wildcard resource.
+        Effect   = "Allow"
+        Action   = ["sqs:GetQueueUrl", "sqs:GetQueueAttributes"]
+        Resource = aws_sqs_queue.dlq.arn
       },
     ]
   })

@@ -27,13 +27,15 @@ spec:
           ports:
             - containerPort: {{ .Values.grafana.port }}
           env:
-            # Anonymous admin access - a local, single-viewer demo dashboard,
-            # not a real login system. Documented tradeoff, not an oversight -
+            # Anonymous viewer access - a local, single-viewer demo
+            # dashboard, not a real login system. Viewer (not Admin): no
+            # anonymous visitor can edit dashboards, change data sources, or
+            # reach the admin API. Documented tradeoff, not an oversight -
             # see DECISIONS.md for what production would use instead.
             - name: GF_AUTH_ANONYMOUS_ENABLED
               value: "true"
             - name: GF_AUTH_ANONYMOUS_ORG_ROLE
-              value: "Admin"
+              value: "Viewer"
             - name: GF_AUTH_DISABLE_LOGIN_FORM
               value: "true"
           securityContext:
