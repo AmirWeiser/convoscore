@@ -1,6 +1,6 @@
 image:
   repository: convoscore
-  tag: "3965051"
+  tag: "078403d"
   pullPolicy: IfNotPresent
 
 api:
