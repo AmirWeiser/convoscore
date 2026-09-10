@@ -25,6 +25,25 @@ dlq_depth = Gauge(
     "convoscore_dlq_depth", "Approximate number of messages currently in the DLQ"
 )
 
+# A TCP liveness check on the metrics port only proves the process is alive,
+# not that the poll loop is making progress (a wedged loop still holds the
+# socket open). This gauge is set after every poll cycle, including empty
+# ones, so a stuck worker is visible as "time() - this value" growing - see
+# DECISIONS.md and the Grafana panel/alert built on it.
+worker_last_poll_timestamp_seconds = Gauge(
+    "convoscore_worker_last_poll_timestamp_seconds",
+    "Unix timestamp of the worker's most recently completed SQS poll cycle",
+)
+
+# Same idea for the DLQ-depth collector specifically: without this, a
+# collector that's stopped updating (e.g. stuck resolving the DLQ URL) looks
+# identical to a genuinely empty, healthy DLQ - both read convoscore_dlq_depth
+# as 0. See DECISIONS.md.
+dlq_collector_last_success_timestamp_seconds = Gauge(
+    "convoscore_dlq_collector_last_success_timestamp_seconds",
+    "Unix timestamp of the last successful DLQ depth collection",
+)
+
 # HTTP-level, API only. path label is the route template
 # (e.g. "/conversations/{conversation_id}"), never the resolved path - a raw
 # resolved path would put a fresh UUID in a label value per request, which

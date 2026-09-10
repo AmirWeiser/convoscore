@@ -43,24 +43,27 @@ def _s3_mock() -> MagicMock:
     return s3
 
 
+def _snapshot(conversation_id) -> dict:
+    with repository.pool.connection() as conn:
+        conn.row_factory = dict_row
+        return conn.execute(
+            "SELECT * FROM conversations WHERE id = %s", (conversation_id,)
+        ).fetchone()
+
+
 def test_redelivery_while_busy_and_not_stale_does_not_delete_message():
     conversation_id = uuid.uuid4()
     key = f"incoming/{conversation_id}-busy-test.json"
     repository.create_pending(conversation_id, key, "s3", "irrelevant test text")
     # Simulate another in-flight delivery that already won the claim,
     # well within the visibility window (not stale).
-    assert repository.claim_for_processing(conversation_id, visibility_timeout_seconds=60) is True
+    assert repository.claim_for_processing(conversation_id, visibility_timeout_seconds=60) is not None
 
     sqs = MagicMock()
     worker_module._process_message(sqs, _s3_mock(), "fake-queue-url", _s3_event_message(key, 2))
 
     sqs.delete_message.assert_not_called()
-    with repository.pool.connection() as conn:
-        conn.row_factory = dict_row
-        row = conn.execute(
-            "SELECT status FROM conversations WHERE id = %s", (conversation_id,)
-        ).fetchone()
-    assert row["status"] == "processing"  # untouched - still owned by the original claim
+    assert _snapshot(conversation_id)["status"] == "processing"  # untouched
 
 
 def test_recovery_after_original_claim_goes_stale(monkeypatch):
@@ -73,7 +76,7 @@ def test_recovery_after_original_claim_goes_stale(monkeypatch):
     conversation_id = uuid.uuid4()
     key = f"incoming/{conversation_id}-recovery-test.json"
     repository.create_pending(conversation_id, key, "s3", "irrelevant test text")
-    assert repository.claim_for_processing(conversation_id, visibility_timeout_seconds=60) is True
+    assert repository.claim_for_processing(conversation_id, visibility_timeout_seconds=60) is not None
 
     # Simulate the visibility timeout genuinely having elapsed for the
     # original (stuck/crashed) claim, without sleeping in the test.
@@ -87,12 +90,7 @@ def test_recovery_after_original_claim_goes_stale(monkeypatch):
     worker_module._process_message(sqs, _s3_mock(), "fake-queue-url", _s3_event_message(key, 3))
 
     sqs.delete_message.assert_called_once()
-    with repository.pool.connection() as conn:
-        conn.row_factory = dict_row
-        row = conn.execute(
-            "SELECT status FROM conversations WHERE id = %s", (conversation_id,)
-        ).fetchone()
-    assert row["status"] == "completed"
+    assert _snapshot(conversation_id)["status"] == "completed"
 
 
 def test_duplicate_delivery_for_a_completed_conversation_is_still_deleted():
@@ -101,19 +99,50 @@ def test_duplicate_delivery_for_a_completed_conversation_is_still_deleted():
     conversation_id = uuid.uuid4()
     key = f"incoming/{conversation_id}-completed-test.json"
     repository.create_pending(conversation_id, key, "s3", "irrelevant test text")
-    assert repository.claim_for_processing(conversation_id, visibility_timeout_seconds=60) is True
+    token = repository.claim_for_processing(conversation_id, visibility_timeout_seconds=60)
 
     class _FakeResult:
         sentiment, risk_score, rationale = "neutral", 0.1, "test"
         model, prompt_version = "fake", "v1"
         input_tokens, output_tokens, estimated_cost_usd = 1, 1, 0.0
 
-    repository.store_result(conversation_id, _FakeResult())
+    assert repository.store_result(conversation_id, token, _FakeResult()) is True
 
     sqs = MagicMock()
     worker_module._process_message(sqs, _s3_mock(), "fake-queue-url", _s3_event_message(key, 2))
 
     sqs.delete_message.assert_called_once()
+
+
+def test_duplicate_redelivery_of_a_completed_conversation_never_rescoresor_changes_the_result(monkeypatch):
+    """The strongest form of the claim-fencing guarantee: not just "a
+    duplicate is deleted", but the stored result itself (including
+    completed_at) is provably byte-for-byte unchanged, and the scorer is
+    never invoked again for an already-completed conversation."""
+    conversation_id = uuid.uuid4()
+    key = f"incoming/{conversation_id}-no-rescoring-test.json"
+    repository.create_pending(conversation_id, key, "s3", "irrelevant test text")
+    monkeypatch.setattr(worker_module, "get_scorer", lambda: FakeScorer())
+
+    sqs = MagicMock()
+    worker_module._process_message(sqs, _s3_mock(), "fake-queue-url", _s3_event_message(key, 1))
+    before = _snapshot(conversation_id)
+    assert before["status"] == "completed"
+
+    def _must_not_be_called(_text):
+        raise AssertionError("scorer must not be invoked for an already-completed conversation")
+
+    scorer = MagicMock()
+    scorer.score.side_effect = _must_not_be_called
+    monkeypatch.setattr(worker_module, "get_scorer", lambda: scorer)
+
+    sqs2 = MagicMock()
+    worker_module._process_message(sqs2, _s3_mock(), "fake-queue-url", _s3_event_message(key, 2))
+
+    scorer.score.assert_not_called()
+    sqs2.delete_message.assert_called_once()
+    after = _snapshot(conversation_id)
+    assert after == before  # byte-for-byte unchanged, including completed_at
 
 
 def test_duplicate_delivery_for_a_validation_failure_is_still_deleted():
@@ -123,8 +152,8 @@ def test_duplicate_delivery_for_a_validation_failure_is_still_deleted():
     conversation_id = uuid.uuid4()
     key = f"incoming/{conversation_id}-validation-test.json"
     repository.create_pending(conversation_id, key, "s3", "irrelevant test text")
-    assert repository.claim_for_processing(conversation_id, visibility_timeout_seconds=60) is True
-    repository.mark_failed(conversation_id, "validation", "ValueError")
+    token = repository.claim_for_processing(conversation_id, visibility_timeout_seconds=60)
+    repository.mark_failed(conversation_id, token, "validation", "ValueError")
 
     sqs = MagicMock()
     worker_module._process_message(sqs, _s3_mock(), "fake-queue-url", _s3_event_message(key, 2))
@@ -149,18 +178,14 @@ def test_duplicate_delivery_for_transient_exhausted_does_not_delete_or_score(mon
     conversation_id = uuid.uuid4()
     key = f"incoming/{conversation_id}-transient-exhausted-test.json"
     repository.create_pending(conversation_id, key, "s3", "irrelevant test text")
-    assert repository.claim_for_processing(conversation_id, visibility_timeout_seconds=60) is True
-    repository.mark_failed(conversation_id, "transient_exhausted", "RuntimeError")
+    token = repository.claim_for_processing(conversation_id, visibility_timeout_seconds=60)
+    repository.mark_failed(conversation_id, token, "transient_exhausted", "RuntimeError")
 
     sqs = MagicMock()
     worker_module._process_message(sqs, _s3_mock(), "fake-queue-url", _s3_event_message(key, 2))
 
     sqs.delete_message.assert_not_called()
     scorer.score.assert_not_called()
-    with repository.pool.connection() as conn:
-        conn.row_factory = dict_row
-        row = conn.execute(
-            "SELECT status, error_category FROM conversations WHERE id = %s", (conversation_id,)
-        ).fetchone()
+    row = _snapshot(conversation_id)
     assert row["status"] == "failed"
     assert row["error_category"] == "transient_exhausted"

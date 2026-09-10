@@ -1,4 +1,5 @@
 import json
+import logging
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -20,6 +21,7 @@ from app.metrics import http_request_duration_seconds, http_requests_total
 from app.models import ConversationAccepted, ConversationIn
 
 setup_logging()
+logger = logging.getLogger("convoscore.api")
 
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 
@@ -59,6 +61,12 @@ class _MetricsMiddleware(BaseHTTPMiddleware):
             path = route.path if route else "unmatched"
             http_requests_total.labels(request.method, path, "500").inc()
             http_request_duration_seconds.labels(request.method, path).observe(duration)
+            # Otherwise a 500 leaves zero trace beyond the metric counter.
+            # exc_info=True captures the real exception, but the global
+            # _JsonFormatter is what guarantees only its type + stack frames
+            # ever reach the log output, never its message/args - see
+            # logging_setup.py and DECISIONS.md.
+            logger.error("unhandled exception handling request", exc_info=True)
             raise
         duration = time.monotonic() - start
         route = request.scope.get("route")
@@ -80,8 +88,16 @@ def healthz():
 def readyz():
     # DB reachability only - never OpenAI. A transient OpenAI outage must not
     # pull this pod out of rotation. See DECISIONS.md.
-    with repository.pool.connection():
-        pass
+    #
+    # Executes a real statement, not just a pool checkout - a pooled
+    # connection can be idle-but-broken (e.g. the DB restarted) without
+    # psycopg necessarily detecting that until something is actually sent
+    # over it. See DECISIONS.md.
+    try:
+        with repository.pool.connection() as conn:
+            conn.execute("SELECT 1")
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="database not reachable") from exc
     return {"status": "ready"}
 
 
@@ -91,20 +107,52 @@ def submit_conversation(body: ConversationIn):
     source_key = f"incoming/{conversation_id}.json"
     repository.create_pending(conversation_id, source_key, "api", body.text)
 
+    s3 = s3_client()
     try:
-        s3_client().put_object(
+        s3.put_object(
             Bucket=config.S3_BUCKET_NAME,
             Key=source_key,
             Body=json.dumps({"text": body.text}),
         )
-    except (BotoCoreError, ClientError) as exc:
-        # Compensating delete: nothing downstream has seen this row yet (no S3
-        # object means no notification means no SQS message was ever
-        # created), so a hard delete is safe. See DECISIONS.md.
-        repository.delete(conversation_id)
-        raise HTTPException(
-            status_code=502, detail="Failed to enqueue conversation for scoring"
-        ) from exc
+    except (BotoCoreError, ClientError) as put_exc:
+        # PutObject raising does not prove S3 never stored the object - a
+        # timeout can be ambiguous (S3 accepts the object and emits a
+        # notification while the client never sees the response). An
+        # unconditional compensating delete would then silently erase
+        # evidence of a conversation the worker is about to process. Do a
+        # bounded, definitive check before deciding anything irreversible.
+        # See DECISIONS.md ("ambiguous enqueue").
+        try:
+            s3.head_object(Bucket=config.S3_BUCKET_NAME, Key=source_key)
+        except ClientError as head_exc:
+            error_code = head_exc.response.get("Error", {}).get("Code")
+            if error_code in ("404", "NoSuchKey"):
+                # Definitive: the object was never stored. Record a visible
+                # failure rather than silently deleting evidence - never a
+                # hard delete, a human or API consumer may already be
+                # looking at this id.
+                repository.record_enqueue_failure(conversation_id, type(put_exc).__name__)
+                raise HTTPException(
+                    status_code=502, detail="Failed to enqueue conversation for scoring"
+                ) from put_exc
+            raise HTTPException(
+                status_code=503, detail="Enqueue status could not be confirmed - retry"
+            ) from head_exc
+        except BotoCoreError as head_exc:
+            # The verification check itself was inconclusive - the true
+            # outcome is unknown. Leave the row exactly as it is (a visible
+            # 'pending' record a human or the worker can still resolve if
+            # the object did land) and ask the client to retry rather than
+            # guessing either way. Production would replace this with a
+            # transactional outbox or a dedicated reconciler - out of scope
+            # for this take-home. See DECISIONS.md.
+            raise HTTPException(
+                status_code=503, detail="Enqueue status could not be confirmed - retry"
+            ) from head_exc
+        # HeadObject found the object: PutObject actually succeeded despite
+        # the client-side exception. Fall through and return 202 normally -
+        # the row and the S3 object both exist, so the worker proceeds as
+        # for any other submission.
 
     return ConversationAccepted(
         id=str(conversation_id),

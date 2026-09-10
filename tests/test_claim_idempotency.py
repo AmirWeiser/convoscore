@@ -18,35 +18,38 @@ def _new_pending(source_key: str) -> uuid.UUID:
     return conversation_id
 
 
+class _FakeResult:
+    sentiment, risk_score, rationale = "neutral", 0.1, "test"
+    model, prompt_version = "fake", "v1"
+    input_tokens, output_tokens, estimated_cost_usd = 1, 1, 0.0
+
+
 def test_fresh_claim_succeeds_once():
     cid = _new_pending(f"incoming/{uuid.uuid4()}.json")
-    assert repository.claim_for_processing(cid, visibility_timeout_seconds=60) is True
+    token = repository.claim_for_processing(cid, visibility_timeout_seconds=60)
+    assert token is not None
     # second claim attempt on the same (now 'processing', not stale) row fails
-    assert repository.claim_for_processing(cid, visibility_timeout_seconds=60) is False
+    assert repository.claim_for_processing(cid, visibility_timeout_seconds=60) is None
 
 
 def test_stale_processing_is_reclaimable():
     cid = _new_pending(f"incoming/{uuid.uuid4()}.json")
-    assert repository.claim_for_processing(cid, visibility_timeout_seconds=1) is True
+    assert repository.claim_for_processing(cid, visibility_timeout_seconds=1) is not None
     time.sleep(1.5)
     # visibility_timeout_seconds=1 has elapsed - this simulates a crashed
     # worker; the row must be reclaimable, not stuck forever.
-    assert repository.claim_for_processing(cid, visibility_timeout_seconds=1) is True
+    assert repository.claim_for_processing(cid, visibility_timeout_seconds=1) is not None
 
 
 def test_completed_row_is_never_reclaimed():
     cid = _new_pending(f"incoming/{uuid.uuid4()}.json")
-    assert repository.claim_for_processing(cid, visibility_timeout_seconds=0) is True
+    token = repository.claim_for_processing(cid, visibility_timeout_seconds=0)
+    assert token is not None
 
-    class _FakeResult:
-        sentiment, risk_score, rationale = "neutral", 0.1, "test"
-        model, prompt_version = "fake", "v1"
-        input_tokens, output_tokens, estimated_cost_usd = 1, 1, 0.0
-
-    repository.store_result(cid, _FakeResult())
+    assert repository.store_result(cid, token, _FakeResult()) is True
     time.sleep(0.2)
     # even with an expired-looking window, 'completed' is terminal - never reclaimed
-    assert repository.claim_for_processing(cid, visibility_timeout_seconds=0) is False
+    assert repository.claim_for_processing(cid, visibility_timeout_seconds=0) is None
 
 
 def test_duplicate_source_key_is_idempotent():

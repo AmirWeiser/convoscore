@@ -6,11 +6,11 @@ import logging
 import signal
 import threading
 import time
-import traceback
 from urllib.parse import unquote_plus
 
 from botocore.exceptions import BotoCoreError, ClientError
 from prometheus_client import start_http_server
+from pydantic import ValidationError
 
 from app import config
 from app.aws_clients import s3_client, sqs_client
@@ -19,11 +19,15 @@ from app.db.pool import init_schema
 from app.logging_setup import setup_logging
 from app.metrics import (
     conversations_processed_total,
+    dlq_collector_last_success_timestamp_seconds,
     dlq_depth,
     openai_estimated_cost_usd_total,
     openai_tokens_total,
     processing_duration_seconds,
+    worker_last_poll_timestamp_seconds,
 )
+from app.models import ConversationIn
+from app.safe_errors import safe_stack_trace
 from app.scoring.factory import get_scorer
 
 logger = logging.getLogger("convoscore.worker")
@@ -38,9 +42,7 @@ def _handle_shutdown_signal(signum, frame):
 
 def _safe_message_context(message: dict) -> dict:
     """Best-effort context for logging a failure - never raises, never
-    includes conversation content. source_key is included when it can be
-    parsed out; conversation_id is not available at this point since it may
-    not exist yet (this runs before upsert_pending_for_ingestion)."""
+    includes conversation content."""
     context = {
         "message_id": message.get("MessageId"),
         "receive_count": message.get("Attributes", {}).get("ApproximateReceiveCount"),
@@ -56,17 +58,176 @@ def _safe_message_context(message: dict) -> dict:
 
 
 def _safe_stack_trace(exc: BaseException) -> str:
-    """Stack frames only - file/line/function, always safe - deliberately
-    never the exception's own str()/args. A third-party library's exception
-    message (OpenAI, boto3, psycopg) is not something this code controls the
-    content of, and has been found to be able to echo back request/response
-    content in some cases (see the OpenAI refusal-message fix in
-    openai_scorer.py) - so no exception message is ever logged or stored
-    anywhere in this project, only its type name plus this frame trail. See
-    DECISIONS.md, and tests/test_no_sensitive_data_in_logs.py for the test
-    that verifies this holds even with synthetic sensitive data forced
-    through this exact path."""
-    return "".join(traceback.format_tb(exc.__traceback__))
+    return safe_stack_trace(exc.__traceback__)
+
+
+def _handle_claim_conflict(conversation_id, key: str, receive_count: int) -> bool:
+    """Called whenever this delivery does not hold the active processing
+    claim for a row - either because claim_for_processing() itself failed,
+    or because a guarded store_result()/mark_failed() reported the claim was
+    superseded by a newer attempt after scoring finished. Either way, the
+    SQS decision must come from the row's *current* authoritative state, not
+    from what this delivery assumed. Returns True iff it is safe to delete
+    this delivery's copy of the message (a genuinely terminal outcome);
+    False means leave it alone. See DECISIONS.md (claim fencing)."""
+    conflict = repository.get_claim_conflict_info(conversation_id)
+    status = conflict["status"] if conflict else None
+    error_category = conflict["error_category"] if conflict else None
+
+    if status == "completed" or (status == "failed" and error_category != "transient_exhausted"):
+        logger.info(
+            "duplicate/superseded delivery for a terminal conversation - safe to delete",
+            extra={
+                "conversation_id": str(conversation_id),
+                "source_key": key,
+                "status": status,
+                "error_category": error_category,
+                "receive_count": receive_count,
+            },
+        )
+        return True
+
+    if status == "failed" and error_category == "transient_exhausted":
+        logger.info(
+            "duplicate/superseded delivery for a transient_exhausted conversation - "
+            "leaving message for SQS's own redrive to the DLQ",
+            extra={
+                "conversation_id": str(conversation_id),
+                "source_key": key,
+                "status": status,
+                "error_category": error_category,
+                "receive_count": receive_count,
+            },
+        )
+        return False
+
+    # 'processing' (not yet stale), or a same-moment 'pending' race - another
+    # delivery owns or is about to own this claim. Leave the message
+    # undeleted: standard SQS redelivery/the stale-reclaim window is what
+    # resolves this, not this delivery deleting it. This is the exact bug
+    # fixed in commit 421fa5a - never regress it.
+    logger.info(
+        "claim skipped or superseded - conversation still owned by another in-flight "
+        "delivery, leaving message for redelivery",
+        extra={
+            "conversation_id": str(conversation_id),
+            "source_key": key,
+            "status": status,
+            "receive_count": receive_count,
+        },
+    )
+    return False
+
+
+def _process_record(sqs, s3, s3_info: dict, receive_count: int) -> bool:
+    """Handles exactly one S3 record from an event message's Records list.
+    Returns True iff this record reached an outcome safe to acknowledge
+    (terminal and correctly recorded); False means the whole message must
+    stay undeleted, since one SQS message can carry multiple records and a
+    message can only be deleted or kept as a whole - see DECISIONS.md and
+    _process_message()."""
+    bucket = s3_info["bucket"]["name"]
+    # S3 event keys are URL-encoded (spaces as "+", etc.) - decode before use,
+    # or GetObject fails to find any key needing escaping.
+    key = unquote_plus(s3_info["object"]["key"])
+
+    try:
+        obj = s3.get_object(Bucket=bucket, Key=key)
+        raw = obj["Body"].read().decode("utf-8", errors="replace")
+    except (BotoCoreError, ClientError) as exc:
+        # Transient (network/service issue, not the object's fault) - leave
+        # the message for standard SQS redelivery/DLQ. Logged on every
+        # attempt, not just the last - see DECISIONS.md.
+        logger.warning(
+            "s3 read failed",
+            extra={
+                "source_key": key,
+                "error_type": type(exc).__name__,
+                "receive_count": receive_count,
+            },
+        )
+        return False
+
+    try:
+        payload = json.loads(raw)
+        parsed = ConversationIn.model_validate(payload)
+    except (json.JSONDecodeError, ValidationError) as exc:
+        # Permanently invalid input - terminal immediately, never retried,
+        # never reaches the DLQ. Both ingestion paths share this one
+        # validation contract (ConversationIn) - see DECISIONS.md. JSON
+        # decode errors carry only position info, safe to store verbatim;
+        # Pydantic's ValidationError can embed the offending input value
+        # (input_value=...) in its formatted message, which could be
+        # conversation content, so only its type name is ever stored/logged
+        # for that case - never str(exc).
+        error_message = str(exc) if isinstance(exc, json.JSONDecodeError) else type(exc).__name__
+        repository.record_validation_failure(key, "s3", raw, error_message)
+        conversations_processed_total.labels(outcome="failed").inc()
+        logger.info(
+            "conversation validation failed",
+            extra={"source_key": key, "error_category": "validation"},
+        )
+        return True
+    text = parsed.text
+
+    conversation_id = repository.upsert_pending_for_ingestion(key, "s3", text)
+
+    token = repository.claim_for_processing(conversation_id, config.VISIBILITY_TIMEOUT_SECONDS)
+    if token is None:
+        return _handle_claim_conflict(conversation_id, key, receive_count)
+
+    start = time.monotonic()
+    try:
+        result = get_scorer().score(text)
+    except Exception as exc:
+        exhausted = receive_count >= config.MAX_RECEIVE_COUNT
+        # Logged on every failed attempt, not only the last one - and never
+        # str(exc): a third-party (OpenAI/network) exception's own message is
+        # not something this code controls the content of. See DECISIONS.md.
+        logger.warning(
+            "conversation scoring attempt failed",
+            extra={
+                "conversation_id": str(conversation_id),
+                "error_type": type(exc).__name__,
+                "receive_count": receive_count,
+                "exhausted": exhausted,
+                "stack_trace": _safe_stack_trace(exc),
+            },
+        )
+        if not exhausted:
+            return False  # message stays undeleted - standard SQS redelivery
+
+        marked = repository.mark_failed(conversation_id, token, "transient_exhausted", type(exc).__name__)
+        if marked:
+            conversations_processed_total.labels(outcome="failed").inc()
+            return False  # leave undeleted - SQS's own redrive moves it to the DLQ
+        # Superseded: a newer claim has since taken over this row (e.g. a
+        # stale reclaim). Our outcome must not overwrite theirs - defer to
+        # the row's current authoritative state instead of assuming.
+        return _handle_claim_conflict(conversation_id, key, receive_count)
+
+    openai_tokens_total.labels(direction="input").inc(result.input_tokens)
+    openai_tokens_total.labels(direction="output").inc(result.output_tokens)
+    openai_estimated_cost_usd_total.inc(result.estimated_cost_usd)
+
+    marked = repository.store_result(conversation_id, token, result)
+    processing_duration_seconds.observe(time.monotonic() - start)
+    if marked:
+        conversations_processed_total.labels(outcome="completed").inc()
+        logger.info(
+            "conversation completed",
+            extra={"conversation_id": str(conversation_id), "model": result.model},
+        )
+        return True
+    # Superseded: a newer claim (stale reclaim) has since taken over this row
+    # - do NOT delete the message purely because *our* scoring finished. The
+    # DB row is authoritative; defer to the same conflict handling used
+    # anywhere else a claim is contested.
+    logger.info(
+        "claim superseded - result computed but not stored (a newer attempt owns this row)",
+        extra={"conversation_id": str(conversation_id), "source_key": key, "receive_count": receive_count},
+    )
+    return _handle_claim_conflict(conversation_id, key, receive_count)
 
 
 def _process_message(sqs, s3, queue_url: str, message: dict) -> None:
@@ -87,176 +248,44 @@ def _process_message(sqs, s3, queue_url: str, message: dict) -> None:
         sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=receipt_handle)
         return
 
-    s3_info = records[0]["s3"]
-    bucket = s3_info["bucket"]["name"]
-    # S3 event keys are URL-encoded (spaces as "+", etc.) - decode before use,
-    # or GetObject fails to find any key needing escaping.
-    key = unquote_plus(s3_info["object"]["key"])
+    # A single SQS message can carry more than one S3 record. Every record
+    # is processed through the same per-record path, and the message is
+    # deleted only if *every* record reached a safe-to-acknowledge outcome -
+    # deleting on a partial result would silently drop whichever record
+    # wasn't actually done yet. See DECISIONS.md.
+    all_safe = True
+    for record in records:
+        safe = _process_record(sqs, s3, record["s3"], receive_count)
+        all_safe = all_safe and safe
 
-    try:
-        obj = s3.get_object(Bucket=bucket, Key=key)
-        raw = obj["Body"].read().decode("utf-8", errors="replace")
-    except (BotoCoreError, ClientError) as exc:
-        # Transient (network/service issue, not the object's fault) - leave
-        # the message for standard SQS redelivery/DLQ. No conversation_id
-        # exists yet to record anything against; DLQ depth is the signal.
-        # Still logged, on every attempt, not just the last - see
-        # DECISIONS.md.
-        logger.warning(
-            "s3 read failed",
-            extra={
-                "source_key": key,
-                "error_type": type(exc).__name__,
-                "receive_count": receive_count,
-            },
-        )
-        return
-
-    try:
-        payload = json.loads(raw)
-        text = payload["text"]
-        if not isinstance(text, str) or not text.strip():
-            raise ValueError("'text' must be a non-empty string")
-    except (json.JSONDecodeError, KeyError, ValueError) as exc:
-        # Permanently invalid input - terminal immediately, never retried,
-        # never reaches the DLQ. See DECISIONS.md. These particular
-        # exception types (JSON position info / a missing key name / this
-        # module's own fixed message) don't carry conversation content, so
-        # str(exc) is safe here specifically - unlike the scoring path below,
-        # which talks to a third-party library and never uses str(exc).
-        repository.record_validation_failure(key, "s3", raw, str(exc))
-        conversations_processed_total.labels(outcome="failed").inc()
-        logger.info(
-            "conversation validation failed",
-            extra={"source_key": key, "error_category": "validation"},
-        )
+    if all_safe:
         sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=receipt_handle)
-        return
-
-    conversation_id = repository.upsert_pending_for_ingestion(key, "s3", text)
-
-    if not repository.claim_for_processing(conversation_id, config.VISIBILITY_TIMEOUT_SECONDS):
-        # SQS visibility starts at receipt time, but processing_started_at is
-        # only written afterwards (after the S3 GetObject + DB round trip
-        # above) - the two clocks are not synchronized even though they use
-        # the same timeout value. A genuine SQS redelivery/duplicate can
-        # therefore arrive while the row is still legitimately owned by
-        # another in-flight delivery and NOT YET stale by the DB's own
-        # clock. Unconditionally deleting this message in that case discards
-        # the only remaining SQS copy of a conversation that hasn't actually
-        # finished - if the owning attempt then crashes, nothing is left to
-        # redeliver or reclaim it, and the row is stuck 'processing' forever.
-        # Status alone is not enough to decide - 'failed' covers two very
-        # different cases. A validation failure is permanently done, so a
-        # duplicate is safe to delete. A transient_exhausted failure's
-        # message must be left exactly alone: it's already earmarked for
-        # SQS's own redrive policy to move to the DLQ once its own
-        # maxReceiveCount is reached, and deleting it here (even for a
-        # "duplicate" delivery) would remove it from SQS ourselves and skip
-        # the DLQ entirely - the opposite of what this project's failure/DLQ
-        # behavior depends on. See DECISIONS.md.
-        conflict = repository.get_claim_conflict_info(conversation_id)
-        status = conflict["status"] if conflict else None
-        error_category = conflict["error_category"] if conflict else None
-
-        if status == "completed" or (status == "failed" and error_category != "transient_exhausted"):
-            logger.info(
-                "duplicate delivery for a terminal conversation - deleting",
-                extra={
-                    "conversation_id": str(conversation_id),
-                    "source_key": key,
-                    "status": status,
-                    "error_category": error_category,
-                    "receive_count": receive_count,
-                },
-            )
-            sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=receipt_handle)
-        elif status == "failed" and error_category == "transient_exhausted":
-            logger.info(
-                "duplicate delivery for a transient_exhausted conversation - leaving message for SQS's own redrive to the DLQ",
-                extra={
-                    "conversation_id": str(conversation_id),
-                    "source_key": key,
-                    "status": status,
-                    "error_category": error_category,
-                    "receive_count": receive_count,
-                },
-            )
-        else:
-            # 'processing' (not yet stale), or a same-moment 'pending' race -
-            # another delivery owns or is about to own this claim. Leave the
-            # message undeleted: standard SQS redelivery/the stale-reclaim
-            # window is what resolves this, not this delivery deleting it.
-            logger.info(
-                "claim skipped - conversation still owned by another in-flight delivery, leaving message for redelivery",
-                extra={
-                    "conversation_id": str(conversation_id),
-                    "source_key": key,
-                    "status": status,
-                    "receive_count": receive_count,
-                },
-            )
-        return
-
-    start = time.monotonic()
-    try:
-        result = get_scorer().score(text)
-    except Exception as exc:
-        exhausted = receive_count >= config.MAX_RECEIVE_COUNT
-        # Logged on every failed attempt, not only the last one - and never
-        # str(exc): a third-party (OpenAI/network) exception's own message is
-        # not something this code controls the content of. error_type (the
-        # exception's class name) plus a message-stripped stack trace is
-        # always safe. See DECISIONS.md and the focused leak test.
-        logger.warning(
-            "conversation scoring attempt failed",
-            extra={
-                "conversation_id": str(conversation_id),
-                "error_type": type(exc).__name__,
-                "receive_count": receive_count,
-                "exhausted": exhausted,
-                "stack_trace": _safe_stack_trace(exc),
-            },
-        )
-        if exhausted:
-            # Last allowed attempt: record why, then leave the message
-            # undeleted so SQS's own redrive policy - not us - moves it to
-            # the DLQ. DLQ depth is the operational signal; this DB row stays
-            # a documented 'failed' record rather than stuck 'processing'.
-            # error_message is the exception's type name only - see above.
-            repository.mark_failed(conversation_id, "transient_exhausted", type(exc).__name__)
-            conversations_processed_total.labels(outcome="failed").inc()
-        return  # message stays undeleted either way - standard SQS redelivery
-
-    openai_tokens_total.labels(direction="input").inc(result.input_tokens)
-    openai_tokens_total.labels(direction="output").inc(result.output_tokens)
-    openai_estimated_cost_usd_total.inc(result.estimated_cost_usd)
-
-    repository.store_result(conversation_id, result)
-    processing_duration_seconds.observe(time.monotonic() - start)
-    conversations_processed_total.labels(outcome="completed").inc()
-    logger.info(
-        "conversation completed",
-        extra={"conversation_id": str(conversation_id), "model": result.model},
-    )
-    sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=receipt_handle)
 
 
 def _update_dlq_depth_periodically(sqs) -> None:
-    try:
-        dlq_url = sqs.get_queue_url(QueueName=config.SQS_DLQ_NAME)["QueueUrl"]
-    except Exception as exc:
-        logger.warning(
-            "could not resolve DLQ url for depth gauge",
-            extra={"error_type": type(exc).__name__, "stack_trace": _safe_stack_trace(exc)},
-        )
-        return
+    dlq_url = None
+    backoff = 5
+    while not _shutdown and dlq_url is None:
+        try:
+            dlq_url = sqs.get_queue_url(QueueName=config.SQS_DLQ_NAME)["QueueUrl"]
+        except Exception as exc:
+            # Bounded exponential backoff, not a permanent give-up - a
+            # transient LocalStack/AWS hiccup at worker startup must not
+            # silently disable DLQ-depth observability for the rest of the
+            # process's life. See DECISIONS.md.
+            logger.warning(
+                "could not resolve DLQ url for depth gauge - retrying",
+                extra={"error_type": type(exc).__name__, "stack_trace": _safe_stack_trace(exc), "retry_in_seconds": backoff},
+            )
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 60)
     while not _shutdown:
         try:
             attrs = sqs.get_queue_attributes(
                 QueueUrl=dlq_url, AttributeNames=["ApproximateNumberOfMessages"]
             )
             dlq_depth.set(int(attrs["Attributes"]["ApproximateNumberOfMessages"]))
+            dlq_collector_last_success_timestamp_seconds.set(time.time())
         except Exception as exc:
             logger.warning(
                 "failed to refresh DLQ depth gauge",
@@ -300,10 +329,7 @@ def main() -> None:
                 _process_message(sqs, s3, queue_url, message)
             except Exception as exc:
                 # Any unexpected failure (not just the scorer's) must never
-                # silently wedge this loop - see DECISIONS.md. Logged with
-                # whatever safe context is available - error type + a
-                # message-stripped stack trace, never str(exc) - so it's
-                # actually debuggable without risking a content/secret leak.
+                # silently wedge this loop - see DECISIONS.md. Never str(exc).
                 # Message stays undeleted; standard SQS redelivery/DLQ
                 # handles it like any other transient failure.
                 logger.error(
@@ -314,6 +340,10 @@ def main() -> None:
                         "stack_trace": _safe_stack_trace(exc),
                     },
                 )
+        # Set after every poll cycle, including empty ones - a TCP liveness
+        # check on the metrics port only proves the process is alive, not
+        # that this loop is making progress. See DECISIONS.md.
+        worker_last_poll_timestamp_seconds.set(time.time())
 
 
 if __name__ == "__main__":

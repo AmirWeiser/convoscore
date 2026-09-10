@@ -65,6 +65,33 @@
           "legendFormat": "cumulative cost (USD)"
         }
       ]
+    },
+    {
+      "id": 5,
+      "title": "Worker health (seconds since last progress)",
+      "type": "stat",
+      "gridPos": { "h": 5, "w": 12, "x": 0, "y": 18 },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 120 }
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "expr": "time() - convoscore_worker_last_poll_timestamp_seconds",
+          "legendFormat": "since last poll cycle"
+        },
+        {
+          "expr": "time() - convoscore_dlq_collector_last_success_timestamp_seconds",
+          "legendFormat": "since last DLQ collection"
+        }
+      ]
     }
   ]
 }
