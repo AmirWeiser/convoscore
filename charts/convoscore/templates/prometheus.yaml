@@ -1,0 +1,70 @@
+# Plain static-scrape-config Prometheus, not the Prometheus Operator -
+# a ServiceMonitor CRD earns its keep at multi-team/multi-service scale;
+# for one app on a single local node, a static scrape_configs block is
+# fewer moving parts for the same observable outcome. See DECISIONS.md.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: convoscore-prometheus
+  labels:
+    {{- include "convoscore.labels" (dict "component" "prometheus") | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "convoscore.labels" (dict "component" "prometheus") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "convoscore.labels" (dict "component" "prometheus") | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534 # prom/prometheus's own "nobody" user
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: prometheus
+          image: {{ .Values.prometheus.image }}
+          args:
+            - --config.file=/etc/prometheus/prometheus.yml
+            - --storage.tsdb.path=/prometheus
+          ports:
+            - containerPort: {{ .Values.prometheus.port }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: config
+              mountPath: /etc/prometheus
+            - name: data
+              mountPath: /prometheus
+          readinessProbe:
+            httpGet:
+              path: /-/ready
+              port: {{ .Values.prometheus.port }}
+          resources:
+            {{- toYaml .Values.prometheus.resources | nindent 12 }}
+      volumes:
+        - name: config
+          configMap:
+            name: convoscore-prometheus-config
+        - name: data
+          emptyDir: {} # metrics history is not durable - acceptable for a local demo, see DECISIONS.md
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: convoscore-prometheus
+  labels:
+    {{- include "convoscore.labels" (dict "component" "prometheus") | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "convoscore.labels" (dict "component" "prometheus") | nindent 4 }}
+  ports:
+    - port: {{ .Values.prometheus.port }}
+      targetPort: {{ .Values.prometheus.port }}

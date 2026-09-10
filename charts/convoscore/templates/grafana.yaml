@@ -1,0 +1,83 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: convoscore-grafana
+  labels:
+    {{- include "convoscore.labels" (dict "component" "grafana") | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "convoscore.labels" (dict "component" "grafana") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "convoscore.labels" (dict "component" "grafana") | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 472 # grafana image's own "grafana" user
+        fsGroup: 472
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: grafana
+          image: {{ .Values.grafana.image }}
+          ports:
+            - containerPort: {{ .Values.grafana.port }}
+          env:
+            # Anonymous admin access - a local, single-viewer demo dashboard,
+            # not a real login system. Documented tradeoff, not an oversight -
+            # see DECISIONS.md for what production would use instead.
+            - name: GF_AUTH_ANONYMOUS_ENABLED
+              value: "true"
+            - name: GF_AUTH_ANONYMOUS_ORG_ROLE
+              value: "Admin"
+            - name: GF_AUTH_DISABLE_LOGIN_FORM
+              value: "true"
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: datasources
+              mountPath: /etc/grafana/provisioning/datasources
+            - name: dashboard-provider
+              mountPath: /etc/grafana/provisioning/dashboards
+            - name: dashboard-json
+              mountPath: /var/lib/grafana/dashboards
+            - name: data
+              mountPath: /var/lib/grafana
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: {{ .Values.grafana.port }}
+          resources:
+            {{- toYaml .Values.grafana.resources | nindent 12 }}
+      volumes:
+        - name: datasources
+          configMap:
+            name: convoscore-grafana-datasources
+        - name: dashboard-provider
+          configMap:
+            name: convoscore-grafana-dashboard-provider
+        - name: dashboard-json
+          configMap:
+            name: convoscore-grafana-dashboard-json
+        - name: data
+          emptyDir: {} # dashboard/user state is not durable - fine for a local demo
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: convoscore-grafana
+  labels:
+    {{- include "convoscore.labels" (dict "component" "grafana") | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "convoscore.labels" (dict "component" "grafana") | nindent 4 }}
+  ports:
+    - port: {{ .Values.grafana.port }}
+      targetPort: {{ .Values.grafana.port }}

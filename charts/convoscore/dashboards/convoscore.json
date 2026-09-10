@@ -1,0 +1,70 @@
+{
+  "title": "ConvoScore",
+  "uid": "convoscore-overview",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "10s",
+  "time": { "from": "now-30m", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Processing rate",
+      "type": "timeseries",
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 0 },
+      "targets": [
+        {
+          "expr": "sum(rate(conversations_processed_total[5m])) by (outcome)",
+          "legendFormat": "{{outcome}}"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Failures / DLQ depth",
+      "type": "timeseries",
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 0 },
+      "targets": [
+        {
+          "expr": "sum(rate(conversations_processed_total{outcome=\"failed\"}[5m]))",
+          "legendFormat": "failure rate"
+        },
+        {
+          "expr": "convoscore_dlq_depth",
+          "legendFormat": "DLQ depth"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Latency (p95)",
+      "type": "timeseries",
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 9 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(processing_duration_seconds_bucket[5m])) by (le))",
+          "legendFormat": "worker processing p95"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket[5m])) by (le))",
+          "legendFormat": "API request p95"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "OpenAI token usage & estimated cost",
+      "type": "timeseries",
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 9 },
+      "targets": [
+        {
+          "expr": "sum(rate(openai_tokens_total[5m])) by (direction)",
+          "legendFormat": "{{direction}} tokens/s"
+        },
+        {
+          "expr": "openai_estimated_cost_usd_total",
+          "legendFormat": "cumulative cost (USD)"
+        }
+      ]
+    }
+  ]
+}

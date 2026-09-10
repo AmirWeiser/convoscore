@@ -1,4 +1,5 @@
 import json
+import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -7,12 +8,18 @@ from botocore.exceptions import BotoCoreError, ClientError
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
+from prometheus_client import make_asgi_app
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from app import config
 from app.aws_clients import s3_client
 from app.db import repository
 from app.db.pool import init_schema
+from app.logging_setup import setup_logging
+from app.metrics import http_request_duration_seconds, http_requests_total
 from app.models import ConversationAccepted, ConversationIn
+
+setup_logging()
 
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 
@@ -24,6 +31,26 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="ConvoScore", lifespan=lifespan)
+app.mount("/metrics", make_asgi_app())
+
+
+class _MetricsMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        start = time.monotonic()
+        response = await call_next(request)
+        duration = time.monotonic() - start
+        # Route template (e.g. "/conversations/{conversation_id}"), never the
+        # resolved path - a resolved path would put a fresh UUID in a label
+        # value per request, the exact unbounded-cardinality mistake this
+        # project avoids elsewhere. See DECISIONS.md.
+        route = request.scope.get("route")
+        path = route.path if route else "unmatched"
+        http_requests_total.labels(request.method, path, str(response.status_code)).inc()
+        http_request_duration_seconds.labels(request.method, path).observe(duration)
+        return response
+
+
+app.add_middleware(_MetricsMiddleware)
 
 
 @app.get("/healthz")

@@ -2,7 +2,9 @@
 (`python -m app.worker`). See DECISIONS.md for the full state-machine design."""
 
 import json
+import logging
 import signal
+import threading
 import time
 from urllib.parse import unquote_plus
 
@@ -13,8 +15,17 @@ from app import config
 from app.aws_clients import s3_client, sqs_client
 from app.db import repository
 from app.db.pool import init_schema
-from app.metrics import conversations_processed_total, processing_duration_seconds
+from app.logging_setup import setup_logging
+from app.metrics import (
+    conversations_processed_total,
+    dlq_depth,
+    openai_estimated_cost_usd_total,
+    openai_tokens_total,
+    processing_duration_seconds,
+)
 from app.scoring.factory import get_scorer
+
+logger = logging.getLogger("convoscore.worker")
 
 _shutdown = False
 
@@ -22,6 +33,25 @@ _shutdown = False
 def _handle_shutdown_signal(signum, frame):
     global _shutdown
     _shutdown = True
+
+
+def _safe_message_context(message: dict) -> dict:
+    """Best-effort context for logging a failure - never raises, never
+    includes conversation content. source_key is included when it can be
+    parsed out; conversation_id is not available at this point since it may
+    not exist yet (this runs before upsert_pending_for_ingestion)."""
+    context = {
+        "message_id": message.get("MessageId"),
+        "receive_count": message.get("Attributes", {}).get("ApproximateReceiveCount"),
+    }
+    try:
+        body = json.loads(message["Body"])
+        records = body.get("Records")
+        if records:
+            context["source_key"] = records[0]["s3"]["object"]["key"]
+    except Exception:
+        pass
+    return context
 
 
 def _process_message(sqs, s3, queue_url: str, message: dict) -> None:
@@ -67,6 +97,10 @@ def _process_message(sqs, s3, queue_url: str, message: dict) -> None:
         # never reaches the DLQ. See DECISIONS.md.
         repository.record_validation_failure(key, "s3", raw, str(exc))
         conversations_processed_total.labels(outcome="failed").inc()
+        logger.info(
+            "conversation validation failed",
+            extra={"source_key": key, "error_category": "validation"},
+        )
         sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=receipt_handle)
         return
 
@@ -89,15 +123,50 @@ def _process_message(sqs, s3, queue_url: str, message: dict) -> None:
             # a documented 'failed' record rather than stuck 'processing'.
             repository.mark_failed(conversation_id, "transient_exhausted", str(exc))
             conversations_processed_total.labels(outcome="failed").inc()
+            logger.warning(
+                "conversation scoring failed, exhausted retries",
+                extra={
+                    "conversation_id": str(conversation_id),
+                    "error_category": "transient_exhausted",
+                    "error_type": type(exc).__name__,
+                    "receive_count": receive_count,
+                },
+            )
         return  # message stays undeleted either way - standard SQS redelivery
+
+    openai_tokens_total.labels(direction="input").inc(result.input_tokens)
+    openai_tokens_total.labels(direction="output").inc(result.output_tokens)
+    openai_estimated_cost_usd_total.inc(result.estimated_cost_usd)
 
     repository.store_result(conversation_id, result)
     processing_duration_seconds.observe(time.monotonic() - start)
     conversations_processed_total.labels(outcome="completed").inc()
+    logger.info(
+        "conversation completed",
+        extra={"conversation_id": str(conversation_id), "model": result.model},
+    )
     sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=receipt_handle)
 
 
+def _update_dlq_depth_periodically(sqs) -> None:
+    try:
+        dlq_url = sqs.get_queue_url(QueueName=config.SQS_DLQ_NAME)["QueueUrl"]
+    except Exception:
+        logger.warning("could not resolve DLQ url for depth gauge", exc_info=True)
+        return
+    while not _shutdown:
+        try:
+            attrs = sqs.get_queue_attributes(
+                QueueUrl=dlq_url, AttributeNames=["ApproximateNumberOfMessages"]
+            )
+            dlq_depth.set(int(attrs["Attributes"]["ApproximateNumberOfMessages"]))
+        except Exception:
+            logger.warning("failed to refresh DLQ depth gauge", exc_info=True)
+        time.sleep(30)
+
+
 def main() -> None:
+    setup_logging()
     # init_schema() completes fully before the metrics port opens - the
     # startupProbe (Helm chart) now provides the startup grace period
     # instead, so a passing startupProbe genuinely means "has a working DB
@@ -110,6 +179,8 @@ def main() -> None:
     sqs = sqs_client()
     s3 = s3_client()
     queue_url = sqs.get_queue_url(QueueName=config.SQS_QUEUE_NAME)["QueueUrl"]
+
+    threading.Thread(target=_update_dlq_depth_periodically, args=(sqs,), daemon=True).start()
 
     while not _shutdown:
         response = sqs.receive_message(
@@ -127,12 +198,18 @@ def main() -> None:
         for message in response.get("Messages", []):
             try:
                 _process_message(sqs, s3, queue_url, message)
-            except Exception:
+            except Exception as exc:
                 # Any unexpected failure (not just the scorer's) must never
-                # silently wedge this loop - see DECISIONS.md. Leave the
-                # message undeleted; standard SQS redelivery/DLQ handles it
-                # like any other transient failure.
-                pass
+                # silently wedge this loop - see DECISIONS.md. Logged with
+                # whatever safe context is available (never conversation
+                # content/secrets) so it's actually debuggable, not just
+                # swallowed. Message stays undeleted; standard SQS
+                # redelivery/DLQ handles it like any other transient failure.
+                logger.error(
+                    "unexpected error processing message",
+                    extra={**_safe_message_context(message), "error_type": type(exc).__name__},
+                    exc_info=True,
+                )
 
 
 if __name__ == "__main__":
