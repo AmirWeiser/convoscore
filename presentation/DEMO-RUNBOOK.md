@@ -30,7 +30,7 @@ Have these open in browser tabs, ready but not yet the focus:
 
 **Fallback if this section fails:** use the screenshots in this folder
 (`review-ui.png`, `grafana-dashboard.png`, `prometheus-alerts.png`) and narrate from
-slides 8 and 11 instead of the live pages.
+slides 7 and 8 instead of the live pages.
 
 ## 1. Success — both ingestion paths (2–3 min)
 
@@ -60,7 +60,7 @@ same result shape, same review page.
 **If it fails:** check `kubectl logs deployment/convoscore-worker --tail=20` for the
 actual error. Most likely cause is a port-forward that died — re-run the
 `kubectl port-forward svc/convoscore-api 8080:8000` command from section 0. Fallback:
-show `review-list.png` / the "Persistence and review" slide (8) instead.
+show `review-list.png` / the "Storage & review" slide (7) instead.
 
 ## 2. Induced failure → DLQ (4–5 min — this one takes real wall-clock time)
 
@@ -94,7 +94,7 @@ at "Failures / DLQ depth" ticking up, and to Prometheus `/alerts` to show
 worker is busy retrying, not stuck.
 
 **If it fails or looks stuck:** confirm the Prometheus port-forward is up (this
-script queries it). Fallback: narrate slide 6 (worker internals) and show
+script queries it). Fallback: narrate slide 5 (scoring trigger) and show
 `grafana-dashboard.png`'s "Failures / DLQ depth" panel from an earlier run.
 
 ## 3. Restart durability (2–3 min)
@@ -118,7 +118,7 @@ same guarantee claim fencing exists for.
 
 **If it fails:** the script exits nonzero if the snapshots differ — that's a real
 finding, not a flaky test, so don't re-run it hoping for a different answer. Check
-`kubectl get pods` for anything crash-looping, and fall back to narrating slide 8's
+`kubectl get pods` for anything crash-looping, and fall back to narrating slide 7's
 durability bullet plus `git log` showing `test_claim_fencing.py` /
 `test_redelivery_no_delete.py` as the underlying proof.
 

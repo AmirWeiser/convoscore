@@ -5,7 +5,12 @@ dependency, not referenced anywhere under app/. Run with:
     .venv/Scripts/python.exe presentation/build_deck.py
 
 Editing: this file *is* the editable source for the deck - change the
-SLIDES list / diagram functions below and re-run to regenerate the .pptx.
+slide functions below and re-run to regenerate the .pptx.
+
+Design system: 10 slides, one idea each, <=4 top-level points on most
+slides. Deeper technical detail (claim-fencing internals, exact IAM
+actions, dirty-tree checks, refusal handling, retry implementation,
+health-gauge internals) lives in speaker notes for Q&A, not on slides.
 """
 
 from pathlib import Path
@@ -21,23 +26,37 @@ HERE = Path(__file__).parent
 SCREENSHOTS = HERE / "screenshots"
 OUT = HERE / "ConvoScore-Presentation.pptx"
 
-# --- palette -----------------------------------------------------------
-NAVY = RGBColor(0x16, 0x2A, 0x3E)
-SLATE = RGBColor(0x3D, 0x53, 0x66)
-TEAL = RGBColor(0x1F, 0x8A, 0x8A)
-AMBER = RGBColor(0xC7, 0x7B, 0x1E)
-LIGHT_BG = RGBColor(0xF6, 0xF7, 0xF9)
+# --- palette -------------------------------------------------------------
+NAVY = RGBColor(0x14, 0x25, 0x3A)
+NAVY_2 = RGBColor(0x1C, 0x33, 0x4D)
+SLATE = RGBColor(0x4A, 0x5A, 0x6A)
+TEAL = RGBColor(0x16, 0x8A, 0x86)
+TEAL_DARK = RGBColor(0x0F, 0x66, 0x64)
+AMBER = RGBColor(0xC9, 0x7A, 0x1A)
+DANGER = RGBColor(0x9E, 0x35, 0x33)
+LIGHT_BG = RGBColor(0xF7, 0xF8, 0xFA)
+CARD_BG = RGBColor(0xFF, 0xFF, 0xFF)
+CARD_LINE = RGBColor(0xE1, 0xE5, 0xEA)
 WHITE = RGBColor(0xFF, 0xFF, 0xFF)
-INK = RGBColor(0x20, 0x24, 0x28)
-MUTED = RGBColor(0x63, 0x6E, 0x77)
+INK = RGBColor(0x1E, 0x24, 0x2B)
+MUTED = RGBColor(0x62, 0x6E, 0x79)
+FAINT = RGBColor(0xB7, 0xC2, 0xCC)
 
-FONT = "Calibri"
+FONT = "Segoe UI"
+FONT_SEMI = "Segoe UI Semibold"
+
+TOTAL_SLIDES = 10
+SLIDE_W = 13.333
+MARGIN = 0.7
+CONTENT_R = SLIDE_W - MARGIN
 
 prs = Presentation()
 prs.slide_width = Inches(13.333)
 prs.slide_height = Inches(7.5)
 BLANK = prs.slide_layouts[6]
 
+
+# --- low-level helpers -----------------------------------------------------
 
 def add_slide():
     return prs.slides.add_slide(BLANK)
@@ -53,57 +72,161 @@ def add_notes(slide, text):
     slide.notes_slide.notes_text_frame.text = text
 
 
-def add_kicker_title(slide, kicker, title, color=NAVY):
-    k = slide.shapes.add_textbox(Inches(0.6), Inches(0.35), Inches(12.1), Inches(0.4))
-    tf = k.text_frame
-    tf.text = kicker.upper()
-    p = tf.paragraphs[0]
-    p.font.size = Pt(13)
-    p.font.bold = True
-    p.font.color.rgb = TEAL
-    p.font.name = FONT
-    p.font.name = FONT
-    for run in p.runs:
-        run.font.name = FONT
+def _font(run, size, color, bold=False, name=FONT, italic=False, spc=None):
+    run.font.size = Pt(size)
+    run.font.bold = bold
+    run.font.italic = italic
+    run.font.color.rgb = color
+    run.font.name = name
+    if spc is not None:
+        rPr = run._r.get_or_add_rPr()
+        rPr.set("spc", str(int(spc * 100)))
 
-    t = slide.shapes.add_textbox(Inches(0.55), Inches(0.68), Inches(12.2), Inches(0.9))
+
+def no_shadow(shape):
+    shape.shadow.inherit = False
+
+
+def rounded(shape, radius=0.06):
+    try:
+        shape.adjustments[0] = radius
+    except (IndexError, AttributeError):
+        pass
+
+
+# --- shared slide chrome -----------------------------------------------
+
+def kicker_title(slide, kicker, title, accent=TEAL, title_color=NAVY):
+    k = slide.shapes.add_textbox(Inches(MARGIN), Inches(0.42), Inches(10.5), Inches(0.32))
+    tf = k.text_frame
+    tf.word_wrap = False
+    p = tf.paragraphs[0]
+    r = p.add_run()
+    r.text = kicker.upper()
+    _font(r, 12.5, accent, bold=True, spc=1.6)
+
+    t = slide.shapes.add_textbox(Inches(MARGIN - 0.03), Inches(0.72), Inches(11.6), Inches(0.7))
     tf = t.text_frame
     tf.word_wrap = True
-    tf.text = title
     p = tf.paragraphs[0]
-    p.font.size = Pt(30)
-    p.font.bold = True
-    p.font.color.rgb = color
-    p.font.name = FONT
-    for run in p.runs:
-        run.font.name = FONT
-    line = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(0.6), Inches(1.5), Inches(2.0), Pt(3))
+    r = p.add_run()
+    r.text = title
+    title_size = 27 if len(title) <= 55 else 22
+    _font(r, title_size, title_color, bold=True)
+
+    line = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(MARGIN), Inches(1.48), Inches(1.15), Pt(3))
     line.fill.solid()
-    line.fill.fore_color.rgb = TEAL
+    line.fill.fore_color.rgb = accent
     line.line.fill.background()
-    return t
+    no_shadow(line)
 
 
-def add_bullets(slide, bullets, left=0.6, top=1.8, width=7.0, height=5.2, size=17, color=INK,
-                 bullet_color=TEAL):
+def footer(slide, section, index, total=TOTAL_SLIDES):
+    sep = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(MARGIN), Inches(6.86), Inches(CONTENT_R - MARGIN), Pt(0.75))
+    sep.fill.solid()
+    sep.fill.fore_color.rgb = CARD_LINE
+    sep.line.fill.background()
+    no_shadow(sep)
+
+    l = slide.shapes.add_textbox(Inches(MARGIN), Inches(6.98), Inches(8.0), Inches(0.32))
+    p = l.text_frame.paragraphs[0]
+    r = p.add_run()
+    r.text = f"ConvoScore  ·  {section}"
+    _font(r, 10, MUTED)
+
+    rgt = slide.shapes.add_textbox(Inches(CONTENT_R - 1.3), Inches(6.98), Inches(1.3), Inches(0.32))
+    p2 = rgt.text_frame.paragraphs[0]
+    p2.alignment = PP_ALIGN.RIGHT
+    r2 = p2.add_run()
+    r2.text = f"{index:02d} / {total}"
+    _font(r2, 10, FAINT)
+
+
+def bullets(slide, items, left, top, width, size=17, gap=13, color=INK,
+            marker_color=TEAL, lead_color=NAVY, line_spacing=1.1, height=4.6):
     box = slide.shapes.add_textbox(Inches(left), Inches(top), Inches(width), Inches(height))
     tf = box.text_frame
     tf.word_wrap = True
-    for i, item in enumerate(bullets):
-        level = 0
-        text = item
-        if isinstance(item, tuple):
-            text, level = item
+    for i, item in enumerate(items):
         p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
-        p.text = ("\u2022  " if level == 0 else "\u2013  ") + text
-        p.font.size = Pt(size if level == 0 else size - 2)
-        p.font.color.rgb = color if level == 0 else MUTED
-        p.font.name = FONT
-        p.space_after = Pt(10 if level == 0 else 4)
-        p.level = 0
-        for run in p.runs:
-            run.font.name = FONT
+        p.line_spacing = line_spacing
+        p.space_after = Pt(gap)
+        m = p.add_run()
+        m.text = "▸  "
+        _font(m, size, marker_color, bold=True)
+        if " — " in item:
+            lead, rest = item.split(" — ", 1)
+            r1 = p.add_run()
+            r1.text = lead
+            _font(r1, size, lead_color, bold=True)
+            r2 = p.add_run()
+            r2.text = " — " + rest
+            _font(r2, size, color)
+        else:
+            r1 = p.add_run()
+            r1.text = item
+            _font(r1, size, color)
     return box
+
+
+def two_col_bullets(slide, left_items, right_items, top=1.95, col_w=5.55, gap_w=0.5,
+                     size=15, height=4.4):
+    lx = MARGIN
+    rx = MARGIN + col_w + gap_w
+    bullets(slide, left_items, lx, top, col_w, size=size, height=height)
+    bullets(slide, right_items, rx, top, col_w, size=size, height=height)
+
+
+def panel(slide, left, top, width, height, accent=TEAL):
+    p = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(left), Inches(top), Inches(width), Inches(height))
+    p.fill.solid()
+    p.fill.fore_color.rgb = CARD_BG
+    p.line.color.rgb = CARD_LINE
+    p.line.width = Pt(0.75)
+    no_shadow(p)
+    rounded(p, 0.035)
+    strip = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(left + 0.16), Inches(top), Inches(width - 0.32), Pt(3.2))
+    strip.fill.solid()
+    strip.fill.fore_color.rgb = accent
+    strip.line.fill.background()
+    no_shadow(strip)
+    return p
+
+
+def panel_header(slide, text, left, top, width, color=NAVY, size=16):
+    t = slide.shapes.add_textbox(Inches(left), Inches(top), Inches(width), Inches(0.4))
+    p = t.text_frame.paragraphs[0]
+    r = p.add_run()
+    r.text = text
+    _font(r, size, color, bold=True)
+
+
+def numbered_step(slide, n, text, left, top, width, accent=TEAL, size=13.5, d=0.36):
+    c = slide.shapes.add_shape(MSO_SHAPE.OVAL, Inches(left), Inches(top), Inches(d), Inches(d))
+    c.fill.solid()
+    c.fill.fore_color.rgb = accent
+    c.line.fill.background()
+    no_shadow(c)
+    tf = c.text_frame
+    tf.word_wrap = False
+    tf.vertical_anchor = MSO_ANCHOR.MIDDLE
+    tf.margin_left = 0
+    tf.margin_right = 0
+    p = tf.paragraphs[0]
+    p.alignment = PP_ALIGN.CENTER
+    r = p.add_run()
+    r.text = str(n)
+    _font(r, 13, WHITE, bold=True)
+
+    tb = slide.shapes.add_textbox(Inches(left + d + 0.16), Inches(top - 0.09), Inches(width - d - 0.16), Inches(0.85))
+    tf2 = tb.text_frame
+    tf2.word_wrap = True
+    p2 = tf2.paragraphs[0]
+    p2.line_spacing = 1.05
+    r2 = p2.add_run()
+    r2.text = text
+    _font(r2, size, INK)
+    return tb
 
 
 def add_picture_fit(slide, path, left, top, max_w, max_h, border=True):
@@ -116,442 +239,469 @@ def add_picture_fit(slide, path, left, top, max_w, max_h, border=True):
     t = Inches(top) + (Inches(max_h) - h) / 2
     pic = slide.shapes.add_picture(str(path), l, t, width=w, height=h)
     if border:
-        pic.line.color.rgb = RGBColor(0xD8, 0xDC, 0xE0)
+        pic.line.color.rgb = CARD_LINE
         pic.line.width = Pt(1)
     return pic
 
 
-def footer(slide, text):
-    box = slide.shapes.add_textbox(Inches(0.6), Inches(7.1), Inches(10), Inches(0.3))
-    p = box.text_frame.paragraphs[0]
-    p.text = text
-    p.font.size = Pt(10)
-    p.font.color.rgb = MUTED
-    p.font.name = FONT
-    for run in p.runs:
-        run.font.name = FONT
+# --- diagram primitives --------------------------------------------------
 
-
-def box(slide, text, left, top, width, height, fill=TEAL, text_color=WHITE, size=13, subtitle=None):
-    shp = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(left), Inches(top), Inches(width), Inches(height))
+def dbox(slide, text, left, top, w, h, fill=TEAL, text_color=WHITE, size=12.5, subtitle=None):
+    shp = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(left), Inches(top), Inches(w), Inches(h))
     shp.fill.solid()
     shp.fill.fore_color.rgb = fill
-    shp.line.color.rgb = fill
-    shp.shadow.inherit = False
+    shp.line.fill.background()
+    no_shadow(shp)
+    rounded(shp, 0.12)
     tf = shp.text_frame
     tf.word_wrap = True
     tf.vertical_anchor = MSO_ANCHOR.MIDDLE
+    tf.margin_left = Pt(4)
+    tf.margin_right = Pt(4)
     p = tf.paragraphs[0]
-    p.text = text
     p.alignment = PP_ALIGN.CENTER
-    p.font.size = Pt(size)
-    p.font.bold = True
-    p.font.color.rgb = text_color
-    p.font.name = FONT
-    for run in p.runs:
-        run.font.name = FONT
+    p.line_spacing = 1.0
+    r = p.add_run()
+    r.text = text
+    _font(r, size, text_color, bold=True)
     if subtitle:
         p2 = tf.add_paragraph()
-        p2.text = subtitle
         p2.alignment = PP_ALIGN.CENTER
-        p2.font.size = Pt(size - 4)
-        p2.font.color.rgb = text_color
-        p2.font.name = FONT
-        for run in p2.runs:
-            run.font.name = FONT
+        r2 = p2.add_run()
+        r2.text = subtitle
+        _font(r2, size - 3.5, text_color)
     return shp
 
 
-def arrow(slide, x1, y1, x2, y2, color=SLATE, width=2.0, dashed=False, label=None):
+def seg(slide, x1, y1, x2, y2, color=SLATE, width=1.75, dashed=False, head=True):
     conn = slide.shapes.add_connector(MSO_CONNECTOR.STRAIGHT, Inches(x1), Inches(y1), Inches(x2), Inches(y2))
     conn.line.color.rgb = color
     conn.line.width = Pt(width)
+    ln = conn.line._get_or_add_ln()
     if dashed:
-        ln = conn.line._get_or_add_ln()
         d = ln.makeelement(qn("a:prstDash"), {"val": "dash"})
         ln.append(d)
-    conn.line.end_arrowhead = True if False else None  # arrowheads set via XML below
-    ln = conn.line._get_or_add_ln()
-    tail = ln.makeelement(qn("a:tailEnd"), {"type": "triangle", "w": "med", "len": "med"})
-    ln.append(tail)
-    if label:
-        mx, my = (x1 + x2) / 2, (y1 + y2) / 2
-        lb = slide.shapes.add_textbox(Inches(mx - 1.1), Inches(my - 0.32), Inches(2.2), Inches(0.32))
-        tf = lb.text_frame
-        tf.word_wrap = False
-        tf.margin_left = 0
-        tf.margin_right = 0
-        p = tf.paragraphs[0]
-        p.text = label
-        p.alignment = PP_ALIGN.CENTER
-        p.font.size = Pt(10.5)
-        p.font.color.rgb = MUTED
-        p.font.name = FONT
-        for run in p.runs:
-            run.font.name = FONT
+    if head:
+        tail = ln.makeelement(qn("a:tailEnd"), {"type": "triangle", "w": "med", "len": "med"})
+        ln.append(tail)
     return conn
 
 
-# ------------------------------------------------------------------ #
+def dlabel(slide, x, y, text, color=MUTED, size=10.5, align=PP_ALIGN.CENTER, width=2.2):
+    lb = slide.shapes.add_textbox(Inches(x - width / 2), Inches(y), Inches(width), Inches(0.3))
+    tf = lb.text_frame
+    tf.word_wrap = False
+    tf.margin_left = 0
+    tf.margin_right = 0
+    p = tf.paragraphs[0]
+    p.alignment = align
+    r = p.add_run()
+    r.text = text
+    _font(r, size, color)
+    return lb
+
+
+def elbow(slide, x1, y1, lane_y, x2, y2, color=AMBER, width=1.6, dashed=False):
+    seg(slide, x1, y1, x1, lane_y, color=color, width=width, dashed=dashed, head=False)
+    seg(slide, x1, lane_y, x2, lane_y, color=color, width=width, dashed=dashed, head=False)
+    seg(slide, x2, lane_y, x2, y2, color=color, width=width, dashed=dashed, head=True)
+
+
+def legend(slide, items, left, top, item_w=3.55):
+    x = left
+    for color, text, dashed in items:
+        ln = slide.shapes.add_connector(MSO_CONNECTOR.STRAIGHT, Inches(x), Inches(top + 0.09), Inches(x + 0.32), Inches(top + 0.09))
+        ln.line.color.rgb = color
+        ln.line.width = Pt(2.0)
+        if dashed:
+            d = ln.line._get_or_add_ln().makeelement(qn("a:prstDash"), {"val": "dash"})
+            ln.line._get_or_add_ln().append(d)
+        lb = slide.shapes.add_textbox(Inches(x + 0.42), Inches(top - 0.06), Inches(item_w - 0.42), Inches(0.3))
+        p = lb.text_frame.paragraphs[0]
+        r = p.add_run()
+        r.text = text
+        _font(r, 10.5, MUTED)
+        x += item_w
+
+
+# ========================================================================
 # Slide 1 - Title
-# ------------------------------------------------------------------ #
+# ========================================================================
 s = add_slide()
 set_background(s, NAVY)
-t = s.shapes.add_textbox(Inches(0.9), Inches(2.55), Inches(11.5), Inches(1.3))
+
+band = s.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(0), Inches(0), Inches(13.333), Inches(7.5))
+band.fill.solid()
+band.fill.fore_color.rgb = NAVY
+band.line.fill.background()
+no_shadow(band)
+accent_bar = s.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(0), Inches(0), Pt(6), Inches(7.5))
+accent_bar.fill.solid()
+accent_bar.fill.fore_color.rgb = TEAL
+accent_bar.line.fill.background()
+no_shadow(accent_bar)
+
+k = s.shapes.add_textbox(Inches(1.0), Inches(2.15), Inches(10.5), Inches(0.35))
+p = k.text_frame.paragraphs[0]
+r = p.add_run()
+r.text = "SOLUTION ENGINEERING / DEVOPS TAKE-HOME"
+_font(r, 13, RGBColor(0x6F, 0xC7, 0xC2), bold=True, spc=2.0)
+
+t = s.shapes.add_textbox(Inches(0.96), Inches(2.55), Inches(11.0), Inches(1.3))
 p = t.text_frame.paragraphs[0]
-p.text = "ConvoScore"
-p.font.size = Pt(54)
-p.font.bold = True
-p.font.color.rgb = WHITE
-p.font.name = FONT
-for run in p.runs:
-    run.font.name = FONT
+r = p.add_run()
+r.text = "ConvoScore"
+_font(r, 56, WHITE, bold=True)
 
-t2 = s.shapes.add_textbox(Inches(0.95), Inches(3.55), Inches(11.0), Inches(1.0))
-p2 = t2.text_frame.paragraphs[0]
-p2.text = "Turning raw support conversations into a scored, reviewable, on-call-ready pipeline."
-p2.font.size = Pt(20)
-p2.font.color.rgb = RGBColor(0xB9, 0xC7, 0xD3)
-p2.font.name = FONT
-for run in p2.runs:
-    run.font.name = FONT
-line = s.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(0.6), Inches(2.35), Pt(4), Inches(0.95))
-line.fill.solid()
-line.fill.fore_color.rgb = TEAL
-line.line.fill.background()
+t2 = s.shapes.add_textbox(Inches(1.0), Inches(3.65), Inches(10.3), Inches(0.9))
+tf = t2.text_frame
+tf.word_wrap = True
+p2 = tf.paragraphs[0]
+r2 = p2.add_run()
+r2.text = "Turning raw support conversations into a scored, reviewable, on-call-ready pipeline."
+_font(r2, 19, RGBColor(0xC3, 0xCF, 0xD9))
 
-t3 = s.shapes.add_textbox(Inches(0.95), Inches(6.6), Inches(10), Inches(0.5))
+t3 = s.shapes.add_textbox(Inches(1.0), Inches(6.55), Inches(10), Inches(0.4))
 p3 = t3.text_frame.paragraphs[0]
-p3.text = "Amir Weiser  ·  Solution Engineer / DevOps take-home"
-p3.font.size = Pt(13)
-p3.font.color.rgb = RGBColor(0x8A, 0x9A, 0xA8)
-p3.font.name = FONT
-for run in p3.runs:
-    run.font.name = FONT
+r3 = p3.add_run()
+r3.text = "Amir Weiser"
+_font(r3, 13, RGBColor(0x9B, 0xAB, 0xB8), bold=True)
+r3b = p3.add_run()
+r3b.text = "   ·   Architecture, ingestion, scoring, deployment, and operations"
+_font(r3b, 13, RGBColor(0x6E, 0x80, 0x8F))
+
 add_notes(s, "One line: this is a small service that scores support conversations with an "
              "LLM and makes the results reviewable and observable - built to show how I'd "
              "design, deploy, and operate a real system, not just make a demo run once.")
 
-# ------------------------------------------------------------------ #
-# Slide 2 - Assignment requirements and constraints
-# ------------------------------------------------------------------ #
+# ========================================================================
+# Slide 2 - What it does & why this architecture
+# ========================================================================
 s = add_slide(); set_background(s)
-add_kicker_title(s, "Assignment", "Requirements and constraints")
-add_bullets(s, [
-    "Ingest support-conversation text two ways: an API call, or a file dropped into storage",
-    "Score each conversation with an LLM: sentiment, a risk score, a short rationale",
-    "Store results durably and make them reviewable by a person - no separate frontend framework",
-    "Package as containers, deploy to Kubernetes, provision cloud resources as code",
-    "Show real observability: logs, metrics, a dashboard, an induced failure that's visible end to end",
-], top=1.8, width=8.0)
-add_bullets(s, [
-    ("Hard constraints I held myself to:", 0),
-    ("SQS is at-least-once - never claim exactly-once processing anywhere", 1),
-    ("An LLM call and a database commit can't be made atomic - don't pretend otherwise", 1),
-    ("Keep the take-home right-sized - no CI, no service mesh, no ORM, no new database", 1),
-], left=0.6, top=5.0, width=8.0, size=15)
-footer(s, "ConvoScore  ·  Assignment scope")
+kicker_title(s, "Overview", "What ConvoScore does, and why it's shaped this way")
+
+panel(s, MARGIN, 1.9, 5.55, 4.35, accent=TEAL)
+panel_header(s, "What it does", MARGIN + 0.3, 2.12, 5.0)
+bullets(s, [
+    "Ingests support conversations two ways — an API call, or a file dropped into storage",
+    "Scores each one with an LLM — sentiment, a 0–1 risk score, a short rationale",
+    "Stores results durably and makes them reviewable by a person — no separate frontend",
+], MARGIN + 0.3, 2.65, 4.95, size=14.5, gap=16, height=3.4)
+
+panel(s, MARGIN + 6.05, 1.9, 5.55, 4.35, accent=AMBER)
+panel_header(s, "Why this architecture", MARGIN + 6.35, 2.12, 5.0)
+bullets(s, [
+    "Decouples ingestion from scoring — a slow or failed OpenAI call never blocks the caller",
+    "One shared pipeline behind both entry points — one code path to trust and test",
+    "Designed around two honest constraints — SQS is at-least-once, and an LLM call can't be made atomic with a DB commit",
+], MARGIN + 6.35, 2.65, 4.95, size=14.5, gap=16, height=3.4, marker_color=AMBER)
+
+footer(s, "Overview", 2)
 add_notes(s, "This slide exists so the reviewer sees I read the brief as a set of constraints, "
-             "not just a feature list - especially the two 'don't oversell it' rules about SQS "
-             "and LLM-call atomicity, which shape a lot of the design choices on later slides.")
+             "not just a feature list. Additional scope notes if asked: kept deliberately "
+             "right-sized — no CI, no service mesh, no ORM, no new database. The two "
+             "constraints on the right (SQS at-least-once, LLM-call/DB-commit non-atomicity) "
+             "shape almost every design choice in the rest of the deck.")
 
-# ------------------------------------------------------------------ #
+# ========================================================================
 # Slide 3 - Architecture diagram
-# ------------------------------------------------------------------ #
+# ========================================================================
 s = add_slide(); set_background(s)
-add_kicker_title(s, "Architecture", "Both ingestion paths, one shared pipeline")
+kicker_title(s, "Architecture", "One pipeline, two doors in")
 
-box(s, "API\nPOST /conversations", 0.7, 2.0, 2.0, 1.0, fill=TEAL)
-box(s, "Direct upload\n(no API call)", 0.7, 3.3, 2.0, 1.0, fill=AMBER)
-box(s, "S3\nincoming/{id}.json", 3.3, 2.65, 1.9, 1.0, fill=SLATE)
-box(s, "SQS\nprocessing queue", 5.75, 2.65, 1.9, 1.0, fill=SLATE)
-box(s, "Worker", 8.2, 2.65, 1.6, 1.0, fill=TEAL)
-box(s, "OpenAI", 8.2, 4.1, 1.6, 0.85, fill=NAVY)
-box(s, "PostgreSQL", 10.35, 2.65, 1.6, 1.0, fill=NAVY)
-box(s, "Review UI", 10.35, 4.1, 1.6, 0.85, fill=SLATE)
-box(s, "SQS DLQ", 5.75, 4.4, 1.9, 0.85, fill=RGBColor(0x8B, 0x2E, 0x2E))
+API = dict(left=0.7, top=2.2, w=1.85, h=0.8)
+DIRECT = dict(left=0.7, top=3.35, w=1.85, h=0.8)
+S3 = dict(left=3.15, top=2.78, w=1.7, h=0.85)
+SQS = dict(left=5.35, top=2.78, w=1.7, h=0.85)
+WORKER = dict(left=7.55, top=2.78, w=1.55, h=0.85)
+OPENAI = dict(left=7.55, top=4.05, w=1.55, h=0.75)
+PG = dict(left=9.65, top=2.78, w=1.65, h=0.85)
+REVIEW = dict(left=9.65, top=4.05, w=1.65, h=0.75)
+DLQ = dict(left=5.35, top=4.05, w=1.7, h=0.75)
 
-arrow(s, 2.7, 2.5, 3.3, 3.05)
-arrow(s, 2.7, 3.8, 3.3, 3.25)
-arrow(s, 5.2, 3.15, 5.75, 3.15, label="S3 event")
-arrow(s, 7.65, 3.15, 8.2, 3.15, label="poll")
-arrow(s, 9.0, 3.65, 9.0, 4.1, label="score")
-arrow(s, 9.8, 3.15, 10.35, 3.15, label="store")
-arrow(s, 11.15, 3.65, 11.15, 4.1)
-arrow(s, 6.7, 3.65, 6.7, 4.4, color=RGBColor(0x8B, 0x2E, 0x2E), dashed=True, label="after retries")
 
-add_bullets(s, [
-    "The API never calls OpenAI - it validates, writes to Postgres as 'pending', puts the object in S3, returns 202",
-    "A direct upload skips the API entirely - the same S3 -> SQS -> worker path picks it up",
-    "One validation contract, one claim/scoring path, one place the DLQ can be reached from",
-], left=0.6, top=5.6, width=12.0, size=14.5)
-footer(s, "ConvoScore  ·  Architecture")
+def ctr(b):
+    return b["left"] + b["w"] / 2, b["top"] + b["h"] / 2
+
+
+def edge(b, side):
+    l, t, w, h = b["left"], b["top"], b["w"], b["h"]
+    return {"l": (l, t + h / 2), "r": (l + w, t + h / 2), "t": (l + w / 2, t), "b": (l + w / 2, t + h)}[side]
+
+
+dbox(s, "API\nPOST /conversations", **API, fill=TEAL)
+dbox(s, "Direct upload\n(no API call)", **DIRECT, fill=AMBER)
+dbox(s, "S3\nincoming/{id}.json", **S3, fill=SLATE)
+dbox(s, "SQS\nprocessing queue", **SQS, fill=SLATE)
+dbox(s, "Worker", **WORKER, fill=TEAL_DARK)
+dbox(s, "OpenAI", **OPENAI, fill=NAVY)
+dbox(s, "PostgreSQL", **PG, fill=NAVY)
+dbox(s, "Review UI", **REVIEW, fill=SLATE)
+dbox(s, "SQS DLQ", **DLQ, fill=DANGER)
+
+# pending-row connector: API writes directly to Postgres, synchronously
+a_top = edge(API, "t")
+pg_top = edge(PG, "t")
+elbow(s, a_top[0], a_top[1], 1.92, pg_top[0], pg_top[1], color=AMBER, dashed=False)
+dlabel(s, (a_top[0] + pg_top[0]) / 2, 1.62, "pending row (sync write)", color=AMBER, size=10.5, width=3.4)
+
+# main pipeline arrows
+seg(s, *edge(API, "r"), *edge(S3, "l"), color=SLATE)
+seg(s, *edge(DIRECT, "r"), *(edge(S3, "l")[0], edge(S3, "l")[1] + 0.001), color=SLATE)
+seg(s, *edge(S3, "r"), *edge(SQS, "l"), color=SLATE)
+dlabel(s, (edge(S3, "r")[0] + edge(SQS, "l")[0]) / 2, 2.5, "S3 event")
+seg(s, *edge(SQS, "r"), *edge(WORKER, "l"), color=SLATE)
+dlabel(s, (edge(SQS, "r")[0] + edge(WORKER, "l")[0]) / 2, 2.5, "poll")
+seg(s, *edge(WORKER, "b"), *edge(OPENAI, "t"), color=TEAL_DARK)
+dlabel(s, edge(WORKER, "b")[0] + 0.62, 3.62, "score", width=1.1)
+seg(s, *edge(WORKER, "r"), *edge(PG, "l"), color=TEAL_DARK)
+dlabel(s, (edge(WORKER, "r")[0] + edge(PG, "l")[0]) / 2, 2.5, "store result")
+seg(s, *edge(PG, "b"), *edge(REVIEW, "t"), color=SLATE)
+seg(s, *edge(SQS, "b"), *edge(DLQ, "t"), color=DANGER, dashed=True)
+dlabel(s, edge(SQS, "b")[0] + 0.85, 3.78, "after 3 attempts", width=1.6, color=DANGER)
+
+legend(s, [
+    (SLATE, "pipeline flow", False),
+    (AMBER, "pending-row write (sync)", False),
+    (DANGER, "exhausted after retries", True),
+], MARGIN, 4.98)
+
+bullets(s, [
+    "The API never calls OpenAI — it writes a pending row to Postgres, puts the object in S3, and returns 202",
+    "A direct upload skips the API entirely — the same S3 → SQS → worker path picks it up",
+    "One validation contract, one scoring path, one place the DLQ can be reached from",
+], MARGIN, 5.4, 11.9, size=13.5, gap=8, height=1.3)
+
+footer(s, "Architecture", 3)
 add_notes(s, "The point of this diagram is 'one pipeline, two doors in.' Whether a conversation "
              "arrives via the API or lands in S3 directly, it converges on the exact same S3 -> "
-             "SQS -> worker code path - there's no special-casing based on how it arrived. "
-             "That's what makes the whole thing testable with one set of behaviors instead of two.")
+             "SQS -> worker code path - there's no special-casing based on how it arrived. The "
+             "amber line is the one part that's NOT on that shared path: the API writes the "
+             "'pending' row straight to Postgres, synchronously, before it ever touches S3, so "
+             "the id exists immediately and the caller gets a stable status URL right away.")
 
-# ------------------------------------------------------------------ #
-# Slide 4 - API ingestion flow
-# ------------------------------------------------------------------ #
+# ========================================================================
+# Slide 4 - Ingestion paths
+# ========================================================================
 s = add_slide(); set_background(s)
-add_kicker_title(s, "Ingestion path 1", "API ingestion, step by step")
-add_bullets(s, [
-    "Client sends POST /conversations with {\"text\": \"...\"}",
-    "Request body is validated once, through the same Pydantic model the worker also uses "
-    "(rejects missing/empty/whitespace-only/non-string/over-20,000-character text)",
-    "A 'pending' row is inserted in Postgres first - the id exists before anything touches S3",
-    "The conversation is written to S3 under incoming/{id}.json",
-    "API returns 202 with the id and a status URL - it does not wait for scoring",
-    "If S3 write fails: a bounded HEAD check decides the outcome - object actually landed -> "
-    "still 202; definitely never landed -> a visible failed/enqueue_failed row, never a silent "
-    "delete of evidence; genuinely unknown -> the row stays visible and pending, client gets a "
-    "retryable 503",
-], size=16.5)
-footer(s, "ConvoScore  ·  API ingestion")
-add_notes(s, "The subtle part is the last bullet. The original naive version deleted the "
-             "pending row on any S3 exception, assuming the exception proved nothing was "
-             "written - but a timeout can mean S3 actually accepted the object and the client "
-             "just never saw the response. Deleting the row in that case would erase a "
-             "conversation the worker is about to legitimately process. So we check before "
-             "deciding, and we never silently destroy evidence when the true outcome is unknown.")
+kicker_title(s, "Ingestion", "How conversations get in: two paths, one pipeline")
 
-# ------------------------------------------------------------------ #
-# Slide 5 - Direct S3 ingestion flow
-# ------------------------------------------------------------------ #
-s = add_slide(); set_background(s)
-add_kicker_title(s, "Ingestion path 2", "Direct S3 ingestion, step by step")
-add_bullets(s, [
-    "Anything else (a script, a colleague, a batch job) puts a JSON object under incoming/ in the S3 bucket",
-    "The bucket has a notification wired to the SQS processing queue for that prefix",
-    "S3 emits an ObjectCreated event -> SQS delivers it to the worker - no API involved at all",
-    "The worker looks up the row by source_key (the S3 key) - none exists yet, so it creates one",
-    "From here it's the identical code path as the API case: validate, claim, score, store",
-    "Same S3 key uploaded twice -> the UNIQUE constraint on source_key means the second upload "
-    "finds the existing row instead of creating a duplicate",
-], size=17)
-footer(s, "ConvoScore  ·  Direct S3 ingestion")
-add_notes(s, "This is the 'triggers scoring' answer for this path: an S3 ObjectCreated event "
-             "under the incoming/ prefix is the trigger, full stop - nothing polls a folder, "
-             "nothing depends on the API being up. That's also why source_key (the S3 object "
-             "key) had to become the idempotency anchor rather than a request-generated id - a "
-             "direct upload never gets one of those from the API.")
+panel(s, MARGIN, 1.9, 5.55, 4.15, accent=TEAL)
+panel_header(s, "Path 1 — API", MARGIN + 0.3, 2.1, 5.0, color=TEAL_DARK)
+numbered_step(s, 1, "POST /conversations with the conversation text", MARGIN + 0.3, 2.68, 4.95, accent=TEAL)
+numbered_step(s, 2, "Validated once; a “pending” row is written to Postgres immediately", MARGIN + 0.3, 3.68, 4.95, accent=TEAL)
+numbered_step(s, 3, "Conversation is written to S3; API returns 202 without waiting for scoring", MARGIN + 0.3, 4.68, 4.95, accent=TEAL)
 
-# ------------------------------------------------------------------ #
-# Slide 6 - Worker, SQS, retries, DLQ, idempotency, claim fencing
-# ------------------------------------------------------------------ #
-s = add_slide(); set_background(s)
-add_kicker_title(s, "Worker internals", "Visibility, retries, DLQ, and claim fencing")
-add_bullets(s, [
-    "SQS visibility timeout (60s) hides a message while it's being worked - if the worker "
-    "doesn't delete it in time, SQS makes it visible again automatically",
-    "maxReceiveCount = 3: after 3 delivery attempts without success, SQS moves the message to "
-    "a dead-letter queue on its own - the worker never has to implement that part",
-    "A transient scoring failure is logged and left undeleted every attempt, not just the last "
-    "one - on the final attempt the row is marked failed/transient_exhausted and still left "
-    "undeleted, so SQS's own redrive (not our code) is what reaches the DLQ",
-    "Idempotency: source_key is UNIQUE - a duplicate delivery of the same object finds the same row",
-    "Claim fencing: every claim gets a fresh processing_token; a superseded (older, slower) "
-    "attempt can never overwrite what a newer attempt already wrote - it's rejected at the database level",
-    "Remaining, honestly stated: a crash between 'OpenAI answered' and 'the guarded commit "
-    "landed' can still cause one extra paid OpenAI call - SQS is at-least-once and an LLM call "
-    "can't be made atomic with a DB commit",
-], size=15)
-footer(s, "ConvoScore  ·  Worker, SQS, idempotency")
-add_notes(s, "Claim fencing is the one piece of this system I'd call genuinely load-bearing: "
-             "without a per-claim token, an old worker attempt that's just running slow could "
-             "come back after a newer attempt already reclaimed and finished the same row, and "
-             "silently overwrite a correct result with a stale one. The fencing turns that into "
-             "'the database rejects the stale write' instead of 'whoever writes last wins.'")
+panel(s, MARGIN + 6.05, 1.9, 5.55, 4.15, accent=AMBER)
+panel_header(s, "Path 2 — Direct S3 upload", MARGIN + 6.35, 2.1, 5.0, color=AMBER)
+numbered_step(s, 1, "A file lands in S3 under incoming/ — no API call at all", MARGIN + 6.35, 2.68, 4.95, accent=AMBER)
+numbered_step(s, 2, "An S3 event notification delivers straight to SQS", MARGIN + 6.35, 3.68, 4.95, accent=AMBER)
+numbered_step(s, 3, "The worker creates the row itself, keyed by the S3 object key", MARGIN + 6.35, 4.68, 4.95, accent=AMBER)
 
-# ------------------------------------------------------------------ #
-# Slide 7 - OpenAI integration
-# ------------------------------------------------------------------ #
-s = add_slide(); set_background(s)
-add_kicker_title(s, "Scoring", "OpenAI integration")
-add_bullets(s, [
-    "Structured output: the model returns sentiment, a 0.0-1.0 risk score, and a one-sentence "
-    "rationale - validated against a Pydantic schema, not parsed out of free text",
-    "20s request timeout; tenacity-driven retries with exponential backoff (one retry "
-    "mechanism, not two - the SDK's own built-in retries are explicitly disabled)",
-    "Every result captures the model name, prompt version, input/output token counts, and an "
-    "estimated cost in USD (a hardcoded per-model price table - an estimate, not a billing feed)",
-    "A model refusal is treated like any other scoring failure and retried the same way - and "
-    "its own explanation text is never stored or logged, since a refusal can echo back part of "
-    "the flagged input",
-    "The OpenAI key reaches only the worker, as a Kubernetes Secret created out-of-band - the "
-    "API never receives it, because the API never calls OpenAI",
-], size=16)
-footer(s, "ConvoScore  ·  OpenAI integration")
-add_notes(s, "Two things worth calling out if asked: first, the API genuinely has no code path "
-             "that can leak the OpenAI key, because it's never injected into that pod's "
-             "environment at all - not a policy, a fact about the deployment. Second, the "
-             "refusal-message exclusion was a real finding, not a hypothetical - a refusal's "
-             "own explanation text can contain fragments of what was flagged.")
+banner = s.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(MARGIN), Inches(6.18), Inches(11.9), Inches(0.5))
+banner.fill.solid()
+banner.fill.fore_color.rgb = NAVY
+banner.line.fill.background()
+no_shadow(banner)
+rounded(banner, 0.25)
+tf = banner.text_frame
+tf.vertical_anchor = MSO_ANCHOR.MIDDLE
+p = tf.paragraphs[0]
+p.alignment = PP_ALIGN.CENTER
+r = p.add_run()
+r.text = "Both converge on the same S3 → SQS → worker pipeline — one validation contract, one scoring code path"
+_font(r, 13, WHITE, bold=True)
 
-# ------------------------------------------------------------------ #
-# Slide 8 - Persistence and human review
-# ------------------------------------------------------------------ #
-s = add_slide(); set_background(s)
-add_kicker_title(s, "Storage and review", "PostgreSQL, durability, and the review UI")
-add_bullets(s, [
-    "One table, one state machine: pending -> processing -> completed, or -> failed "
-    "(validation / transient_exhausted / enqueue_failed)",
-    "PostgreSQL runs as a StatefulSet backed by a PersistentVolumeClaim",
-    "Durability is demonstrated, not just claimed: the restart demo captures a completed "
-    "row's full result before deleting the API, worker, and Postgres pods, then proves the "
-    "row is byte-for-byte identical afterward - including the completed_at timestamp",
-    "Human review is two server-rendered pages: a list (status, sentiment, risk, created) and "
-    "a detail view (full result, timestamps, failure reason if any) - no separate frontend build",
-], size=17, width=6.7)
-add_picture_fit(s, SCREENSHOTS / "review-detail.png", 7.5, 1.75, 5.2, 5.3)
-footer(s, "ConvoScore  ·  Persistence and review")
-add_notes(s, "The screenshot on the right is a real conversation from the deployed system, not "
-             "a mock. Point out that 'durability is demonstrated' - the restart demo is the "
-             "actual proof, and it specifically checks completed_at hasn't changed, because a "
-             "re-scored duplicate would also show 'completed' but with a different timestamp.")
+footer(s, "Ingestion paths", 4)
+add_notes(s, "API path detail: the request body is validated through the same Pydantic model "
+             "the worker also uses (rejects missing/empty/whitespace-only/non-string/over-20,000 "
+             "character text). If the S3 write's outcome is genuinely unknown (e.g. a timeout), "
+             "the row stays visible and pending rather than being silently deleted - deleting on "
+             "an ambiguous failure could erase a conversation S3 actually accepted.\n\n"
+             "Direct-upload detail: source_key (the S3 key) is the idempotency anchor, since a "
+             "direct upload never gets an id from the API. A UNIQUE constraint on source_key "
+             "means the same key uploaded twice finds the existing row instead of duplicating it.")
 
-# ------------------------------------------------------------------ #
-# Slide 9 - Kubernetes and deployment
-# ------------------------------------------------------------------ #
+# ========================================================================
+# Slide 5 - Scoring trigger, retries, DLQ
+# ========================================================================
 s = add_slide(); set_background(s)
-add_kicker_title(s, "Deployment", "Kubernetes: one image, two commands")
-add_bullets(s, [
-    "Multi-stage Docker build: a builder stage installs dependencies into a venv; the runtime "
-    "stage copies only that venv plus app/ - no git metadata, tests, or Terraform state",
-    "One image, two entrypoints - `python -m uvicorn app.main:app` for the API, "
-    "`python -m app.worker` for the worker - the Helm chart just overrides the container command",
-    "Non-root (uid 1000), read-only root filesystem, all Linux capabilities dropped, "
-    "seccomp RuntimeDefault, no auto-mounted service account token",
-    "Startup/liveness/readiness probes tuned to real behavior - readiness runs an actual "
-    "SELECT 1, not just a pool checkout, and a generous startup grace period covers a "
-    "cold Postgres pull without the liveness probe killing an otherwise-healthy pod",
-    "The image tag is always the current git SHA - deploy.sh now refuses to build at all if "
-    "any tracked source/Docker/Helm/Terraform file has uncommitted changes, so one tag can "
-    "never silently point at two different images",
-], size=15.5)
-footer(s, "ConvoScore  ·  Kubernetes and deployment")
-add_notes(s, "The dirty-tree check is a small thing that closes a real gap: without it, you "
-             "could build, deploy, make one more uncommitted edit, and rebuild - now the exact "
-             "same SHA-tagged image name refers to two different sets of code, and nobody can "
-             "tell which one is actually running from the tag alone.")
+kicker_title(s, "Scoring", "How scoring is triggered — and what happens when it fails")
 
-# ------------------------------------------------------------------ #
-# Slide 10 - Terraform and security
-# ------------------------------------------------------------------ #
-s = add_slide(); set_background(s)
-add_kicker_title(s, "Infrastructure as code", "Terraform, notifications, and least privilege")
-add_bullets(s, [
-    "Terraform (against LocalStack, standing in for AWS) provisions everything the pipeline "
-    "needs: the S3 bucket, the processing queue, its dead-letter queue, and the redrive policy "
-    "linking them",
-    "An S3 bucket notification wires ObjectCreated events under incoming/ straight to the "
-    "SQS queue - this is what makes the direct-upload path work with zero polling",
-    "IAM policies describe the intended least-privilege shape per component: the API can only "
-    "PutObject under incoming/*; the worker can GetObject there, and can "
-    "Receive/Delete/GetAttributes only on the processing queue plus GetUrl/GetAttributes only "
-    "on the DLQ - never a wildcard resource",
-    "Honest caveat: LocalStack Community does not enforce IAM at the API-call level - these "
-    "policies show the real-AWS shape, they don't actually restrict anything in this environment",
-    "Kubernetes Secrets are created out-of-band by a small script, referenced by name from the "
-    "Helm chart, and never templated into it or committed to Git",
-], size=15.5)
-footer(s, "ConvoScore  ·  Terraform and security")
-add_notes(s, "If asked 'how is least privilege represented' - the honest two-part answer is on "
-             "this slide: the IAM policies are written correctly and scoped tightly, but "
-             "LocalStack doesn't actually enforce them, so what's being demonstrated here is "
-             "the intended shape for real AWS, not a currently-enforced restriction.")
+SQS2 = dict(left=0.9, top=2.55, w=1.8, h=0.85)
+WK2 = dict(left=3.5, top=2.55, w=1.8, h=0.85)
+PG2 = dict(left=8.9, top=2.55, w=1.9, h=0.85)
+OA2 = dict(left=3.5, top=3.85, w=1.8, h=0.75)
+DLQ2 = dict(left=0.9, top=3.85, w=1.8, h=0.75)
 
-# ------------------------------------------------------------------ #
-# Slide 11 - Observability
-# ------------------------------------------------------------------ #
+dbox(s, "SQS\nprocessing queue", **SQS2, fill=SLATE)
+dbox(s, "Worker", **WK2, fill=TEAL_DARK)
+dbox(s, "OpenAI", **OA2, fill=NAVY)
+dbox(s, "PostgreSQL", **PG2, fill=NAVY)
+dbox(s, "SQS DLQ", **DLQ2, fill=DANGER)
+
+wk_top = edge(WK2, "t")
+sqs_top = edge(SQS2, "t")
+elbow(s, wk_top[0], wk_top[1], 2.25, sqs_top[0], sqs_top[1], color=SLATE, dashed=True)
+dlabel(s, (wk_top[0] + sqs_top[0]) / 2, 1.95, "retry (visibility timeout)", color=SLATE, width=2.6)
+
+seg(s, *edge(SQS2, "r"), *edge(WK2, "l"), color=SLATE)
+dlabel(s, (edge(SQS2, "r")[0] + edge(WK2, "l")[0]) / 2, 2.22, "poll")
+seg(s, *edge(WK2, "b"), *edge(OA2, "t"), color=TEAL_DARK)
+dlabel(s, edge(WK2, "b")[0] + 0.6, 3.42, "score", width=1.0)
+seg(s, *edge(WK2, "r"), *edge(PG2, "l"), color=TEAL_DARK)
+dlabel(s, (edge(WK2, "r")[0] + edge(PG2, "l")[0]) / 2, 2.22, "commit result", width=3.6)
+seg(s, *edge(SQS2, "b"), *edge(DLQ2, "t"), color=DANGER, dashed=True)
+dlabel(s, edge(SQS2, "b")[0] + 0.75, 3.62, "after 3 attempts", width=1.5, color=DANGER)
+
+bullets(s, [
+    "The worker polls SQS continuously — a message stays invisible while it's being worked, and reappears automatically if not finished in time",
+    "A transient failure is retried automatically; after 3 attempts SQS moves the message to the DLQ on its own",
+    "Duplicate deliveries and out-of-order retries are both handled — the same object never scores into two rows, and a stale attempt can't overwrite a newer result",
+], MARGIN, 4.95, 11.9, size=14, gap=11, height=1.8)
+
+footer(s, "Scoring trigger", 5)
+add_notes(s, "Trigger is SQS visibility, full stop - the worker is a simple poll loop, nothing "
+             "depends on the API being up. Idempotency: source_key is UNIQUE. Claim fencing "
+             "(the load-bearing safety net): every claim gets a fresh processing_token, so a "
+             "superseded/slower attempt is rejected at the database level rather than silently "
+             "overwriting a newer, correct result - without it, 'whoever writes last wins' could "
+             "clobber a good row with a stale one. Honest remaining gap: a crash between "
+             "'OpenAI answered' and 'the guarded commit landed' can still cause one extra paid "
+             "OpenAI call - SQS is at-least-once and an LLM call can't be made atomic with a DB "
+             "commit.")
+
+# ========================================================================
+# Slide 6 - OpenAI security and failure handling
+# ========================================================================
 s = add_slide(); set_background(s)
-add_kicker_title(s, "Observability", "Logs, metrics, dashboard, and what's on watch")
-add_bullets(s, [
-    "Structured JSON logs, stdout only - never a raw exception message or third-party "
-    "exception text, only its type name plus stack frames, enforced through one shared "
-    "formatter used everywhere including unhandled-exception paths",
-    "Prometheus metrics: processing outcomes, HTTP/processing latency, OpenAI tokens and "
-    "estimated cost, DLQ depth, plus two health gauges most dashboards skip",
-    "Worker-loop and DLQ-collector 'last progress' timestamps - a bare TCP liveness check only "
-    "proves the process is alive, not that it's doing anything; these gauges (and a matching "
-    "Prometheus alert) catch a wedged loop that liveness alone would miss",
-], size=16, width=6.6)
-add_picture_fit(s, SCREENSHOTS / "grafana-dashboard.png", 7.3, 1.7, 5.4, 4.0)
-add_picture_fit(s, SCREENSHOTS / "prometheus-alerts.png", 7.3, 5.75, 5.4, 1.4)
-footer(s, "ConvoScore  ·  Observability")
-add_notes(s, "On-call would watch: DLQ depth rising, the two staleness gauges (worker loop / "
-             "DLQ collector), the API's 5xx rate, and the cost counter's rate of change as a "
+kicker_title(s, "Scoring safely", "OpenAI: structured output, bounded retries, isolated secret")
+
+bullets(s, [
+    "The model returns a validated structured result — sentiment, a 0–1 risk score, a one-sentence rationale — not text parsed out of free-form output",
+    "Requests are bounded by a timeout and a small number of automatic retries, so one slow or failing call can't stall the worker indefinitely",
+    "A refusal is treated as a scoring failure like any other, and its explanation text is never stored or logged — it can echo back part of the flagged input",
+    "The OpenAI API key is only ever injected into the worker — the API service never receives it, because the API never calls OpenAI",
+], MARGIN, 1.95, 11.4, size=18, gap=20, height=4.6)
+
+footer(s, "OpenAI integration", 6)
+add_notes(s, "Every result also captures model name, prompt version, input/output token counts, "
+             "and an estimated cost in USD from a hardcoded per-model price table (an estimate, "
+             "not a billing feed). Retries use one mechanism (tenacity with exponential backoff) "
+             "- the SDK's own built-in retries are explicitly disabled so there's exactly one "
+             "retry policy to reason about, not two stacked on each other. The API-can't-leak-"
+             "the-key point is a fact about the deployment, not just a policy: the key is never "
+             "injected into that pod's environment at all.")
+
+# ========================================================================
+# Slide 7 - Durable storage & human review
+# ========================================================================
+s = add_slide(); set_background(s)
+kicker_title(s, "Storage & review", "PostgreSQL durability, and a human in the loop")
+
+bullets(s, [
+    "One table, one clear state machine — pending → processing → completed, or failed",
+    "Postgres runs as a StatefulSet with a PersistentVolumeClaim — restart the pods and the data, including timestamps, survives unchanged",
+    "Review is two server-rendered pages — a list and a detail view — no separate frontend to build or ship",
+], MARGIN, 1.95, 6.5, size=16.5, gap=20, height=4.4)
+add_picture_fit(s, SCREENSHOTS / "review-detail.png", 7.55, 1.9, 5.05, 4.65)
+
+footer(s, "Storage and review", 7)
+add_notes(s, "The screenshot is a real conversation from the deployed system, not a mock. "
+             "Durability is demonstrated, not just claimed: the restart demo captures a "
+             "completed row's full result before deleting the API, worker, and Postgres pods, "
+             "then proves the row is byte-for-byte identical afterward, including "
+             "completed_at - a re-scored duplicate would also say 'completed' but with a "
+             "different timestamp, so that field is the real proof, not just the status.")
+
+# ========================================================================
+# Slide 8 - Observability & induced failure
+# ========================================================================
+s = add_slide(); set_background(s)
+kicker_title(s, "Observability", "Logs, metrics, a dashboard — and a failure induced on purpose")
+
+bullets(s, [
+    "Structured JSON logs and Prometheus metrics cover latency, processing outcomes, DLQ depth, and OpenAI tokens/cost",
+    "A deterministic trigger fails one conversation on purpose — it retries 3 times and lands in the DLQ, while a healthy conversation submitted alongside it completes normally the whole time",
+    "The dashboard and alerts show it live — DLQ depth rises during the failure, and the alert clears once the message is drained",
+], MARGIN, 1.95, 6.5, size=15.5, gap=18, height=4.5)
+add_picture_fit(s, SCREENSHOTS / "grafana-dashboard.png", 7.5, 1.85, 5.1, 3.55)
+add_picture_fit(s, SCREENSHOTS / "prometheus-alerts.png", 7.5, 5.55, 5.1, 1.15)
+
+footer(s, "Observability", 8)
+add_notes(s, "On-call would watch: DLQ depth rising, two 'last progress' staleness gauges on the "
+             "worker loop and DLQ collector (a bare TCP liveness check only proves the process "
+             "is alive, not that it's doing anything - these catch a wedged loop that liveness "
+             "alone would miss), the API's 5xx rate, and the cost counter's rate of change as a "
              "runaway-spend signal. Both screenshots are from the live deployed system. Worth "
-             "mentioning if asked: I found and fixed a real bug while preparing these "
-             "screenshots - the health gauges are defined in a module shared by both the API "
-             "and worker processes, so without a job label filter the API's own "
-             "always-zero copy made both alerts fire permanently. Small, but it's exactly the "
-             "kind of false-positive that trains an on-call engineer to ignore alerts.")
+             "mentioning if asked: found and fixed a real bug preparing these - the health "
+             "gauges are defined in a module shared by both API and worker processes, so "
+             "without a job-label filter the API's own always-zero copy made both alerts fire "
+             "permanently. Exactly the kind of false positive that trains on-call to ignore "
+             "alerts.")
 
-# ------------------------------------------------------------------ #
-# Slide 12 - Live demo flow
-# ------------------------------------------------------------------ #
+# ========================================================================
+# Slide 9 - Infrastructure
+# ========================================================================
 s = add_slide(); set_background(s)
-add_kicker_title(s, "Live demo", "Success, direct S3, induced failure, restart")
-add_bullets(s, [
-    "1. Success: submit via the API and upload directly to S3 - both reach completed with a "
-    "real OpenAI result, checked straight against Postgres",
-    "2. Induced failure: a deterministic trigger fails scoring on purpose - watch it retry "
-    "3 times roughly 60 seconds apart, land in the DLQ, and a healthy conversation submitted "
-    "alongside it complete normally the whole time",
-    "3. Restart: delete the API, worker, and Postgres pods - watch them come back on the same "
-    "image tag, and confirm the pre-restart result is unchanged, down to the timestamp",
-    "Exact commands, expected output, timing, and fallback screenshots are in "
-    "presentation/DEMO-RUNBOOK.md",
-], size=18)
-footer(s, "ConvoScore  ·  Live demo")
-add_notes(s, "Follow DEMO-RUNBOOK.md in order during the actual session - it has the exact "
-             "commands, what should print at each step, how long each part takes, and what to "
-             "show instead if a live command doesn't cooperate on the day.")
+kicker_title(s, "Infrastructure", "Terraform, one image, Helm, and secrets kept out of the chart")
 
-# ------------------------------------------------------------------ #
-# Slide 13 - Tradeoffs and known limitations
-# ------------------------------------------------------------------ #
-s = add_slide(); set_background(s)
-add_kicker_title(s, "Honesty check", "Tradeoffs and known limitations")
-add_bullets(s, [
-    "No exactly-once processing claim anywhere - SQS is at-least-once by design",
-    "A crash between an OpenAI response and the guarded commit can cause one extra paid "
-    "OpenAI call for the same conversation - bounded and rare, not eliminated",
-    "Prometheus and Grafana storage is emptyDir - metrics/dashboard history do not survive a pod restart",
-    "LocalStack Community does not enforce the IAM policies Terraform defines",
-    "Pod-restart durability is demonstrated; full cluster deletion or losing the underlying "
-    "volume is not, and isn't claimed to be",
-    "Grafana uses anonymous viewer access and cost figures are estimates from a hardcoded "
-    "pricing table - both explicit, documented tradeoffs for a local take-home, not oversights",
-], size=17)
-footer(s, "ConvoScore  ·  Tradeoffs and limitations")
-add_notes(s, "This slide is deliberately unflattering. Every item here is something I found or "
-             "decided, not something a reviewer would have to find themselves - I'd rather say "
-             "it out loud than have it discovered.")
+bullets(s, [
+    "Terraform provisions the S3 bucket, the processing queue, its DLQ, and the event notification wiring them together",
+    "One Docker image, two runtime commands — the API and worker run the same image; Helm just overrides the container command",
+    "Deployed via Helm: non-root, read-only filesystem, health probes tuned to real startup behavior",
+    "Secrets are created out-of-band and referenced by name — never templated into the chart or committed to Git; IAM policies follow least privilege per component",
+], MARGIN, 1.95, 11.6, size=16.5, gap=17, height=4.6)
 
-# ------------------------------------------------------------------ #
-# Slide 14 - What changes for production
-# ------------------------------------------------------------------ #
+footer(s, "Infrastructure", 9)
+add_notes(s, "Docker: multi-stage build - a builder stage installs dependencies into a venv, the "
+             "runtime stage copies only that venv plus app/, no git metadata/tests/Terraform "
+             "state. Deploy safety: deploy.sh tags images with the current git SHA and refuses "
+             "to build at all if any tracked source/Docker/Helm/Terraform file has uncommitted "
+             "changes, so one tag can never silently point at two different images. Least "
+             "privilege specifics: the API can only PutObject under incoming/*; the worker can "
+             "GetObject there and Receive/Delete/GetAttributes only on the processing queue plus "
+             "GetUrl/GetAttributes on the DLQ - never a wildcard resource. Honest caveat: "
+             "LocalStack Community doesn't enforce IAM at the API-call level, so these policies "
+             "show the intended real-AWS shape, not a currently-enforced restriction.")
+
+# ========================================================================
+# Slide 10 - Tradeoffs, exclusions, and production roadmap
+# ========================================================================
 s = add_slide(); set_background(s)
-add_kicker_title(s, "Looking ahead", "What changes for real production")
-add_bullets(s, [
-    "Managed database and queue/storage services (RDS/ElastiCache-equivalent, real SQS/S3) "
-    "instead of a self-hosted Postgres pod and LocalStack",
-    "Workload identity (e.g. IRSA) instead of static test/test AWS credentials",
-    "An external secret manager instead of manually-created Kubernetes Secrets",
-    "Authenticated Grafana with real users and roles; persistent metrics/dashboard storage",
-    "High availability (multiple replicas, an HA Postgres topology), autoscaling on queue depth",
-    "Alert routing to a real on-call system instead of Prometheus-only visibility",
-    "Backups, TLS/Ingress, conversation-content retention and privacy controls",
-    "A transactional outbox or idempotency-keyed LLM call to close the remaining "
-    "duplicate-OpenAI-call window described earlier",
-], size=15.5)
-footer(s, "ConvoScore  ·  Production roadmap")
-add_notes(s, "Frame this as 'what I'd do next with more time and a real budget,' not "
-             "'what's missing from this submission' - the take-home was deliberately scoped "
-             "smaller than this list on purpose.")
+kicker_title(s, "Honest tradeoffs", "What this skips, and what changes in production")
+
+panel(s, MARGIN, 1.9, 5.55, 4.6, accent=DANGER)
+panel_header(s, "Tradeoffs & exclusions", MARGIN + 0.3, 2.1, 5.0, color=DANGER)
+bullets(s, [
+    "No exactly-once claim anywhere — SQS is at-least-once by design",
+    "A crash between an OpenAI response and the DB commit can still cause one extra paid call — bounded and rare, not eliminated",
+    "LocalStack doesn't enforce the IAM policies Terraform defines — they show the intended shape for real AWS",
+    "Scoped down on purpose — no CI, no service mesh, no ORM, no new database",
+], MARGIN + 0.3, 2.62, 4.95, size=12.8, gap=13, height=3.8, marker_color=DANGER)
+
+panel(s, MARGIN + 6.05, 1.9, 5.55, 4.6, accent=TEAL)
+panel_header(s, "What changes in production", MARGIN + 6.35, 2.1, 5.0, color=TEAL_DARK)
+bullets(s, [
+    "RDS for PostgreSQL and managed SQS/S3, instead of a self-hosted Postgres pod and LocalStack",
+    "Workload identity (e.g. IRSA) and an external secret manager, instead of static credentials and manual Kubernetes Secrets",
+    "High availability, autoscaling on queue depth, persistent metrics storage, real alert routing",
+    "Narrowing — not fully closing — the OpenAI-response-to-commit duplicate window, e.g. with an idempotency key on the LLM call",
+], MARGIN + 6.35, 2.62, 4.95, size=12.8, gap=13, height=3.8)
+
+footer(s, "Tradeoffs and roadmap", 10)
+add_notes(s, "This slide is deliberately unflattering on the left and forward-looking on the "
+             "right. Every item on the left is something I found or decided, not something a "
+             "reviewer would have to find themselves. On the right: frame it as 'what I'd do "
+             "next with more time and a real budget,' not 'what's missing from this "
+             "submission' - the take-home was deliberately scoped smaller than this list on "
+             "purpose. Note the duplicate-call window is narrowed by an idempotency key, not "
+             "solved outright - a transactional outbox pattern doesn't apply here since the "
+             "non-atomic boundary is an external OpenAI call, not two local writes. Other "
+             "production gaps worth naming if asked: Prometheus/Grafana storage is emptyDir "
+             "today (no history across restarts), Grafana uses anonymous viewer access, and "
+             "cost figures are estimates from a hardcoded pricing table - all explicit, "
+             "documented tradeoffs for a local take-home, not oversights.")
 
 prs.save(str(OUT))
 print(f"Wrote {OUT} ({len(prs.slides)} slides)")
