@@ -666,42 +666,111 @@ add_notes(s, "Docker: multi-stage build - a builder stage installs dependencies 
              "show the intended real-AWS shape, not a currently-enforced restriction.")
 
 # ========================================================================
-# Slide 10 - Tradeoffs, exclusions, and production roadmap
+# Slide 10 - Production deployment roadmap
 # ========================================================================
 s = add_slide(); set_background(s)
-kicker_title(s, "Honest tradeoffs", "What this skips, and what changes in production")
+kicker_title(s, "Looking ahead", "Production deployment roadmap")
 
-panel(s, MARGIN, 1.9, 5.55, 4.6, accent=DANGER)
-panel_header(s, "Tradeoffs & exclusions", MARGIN + 0.3, 2.1, 5.0, color=DANGER)
-bullets(s, [
-    "No exactly-once claim anywhere — SQS is at-least-once by design",
-    "A crash between an OpenAI response and the DB commit can still cause one extra paid call — bounded and rare, not eliminated",
-    "LocalStack doesn't enforce the IAM policies Terraform defines — they show the intended shape for real AWS",
-    "Scoped down on purpose — no CI, no service mesh, no ORM, no new database",
-], MARGIN + 0.3, 2.62, 4.95, size=12.8, gap=13, height=3.8, marker_color=DANGER)
+cap = s.shapes.add_textbox(Inches(MARGIN), Inches(1.58), Inches(11.6), Inches(0.3))
+p = cap.text_frame.paragraphs[0]
+r = p.add_run()
+r.text = "A proposed CI/CD path for production — not part of this take-home's current deployment"
+_font(r, 12, MUTED, italic=True)
 
-panel(s, MARGIN + 6.05, 1.9, 5.55, 4.6, accent=TEAL)
-panel_header(s, "What changes in production", MARGIN + 6.35, 2.1, 5.0, color=TEAL_DARK)
-bullets(s, [
-    "RDS for PostgreSQL and managed SQS/S3, instead of a self-hosted Postgres pod and LocalStack",
-    "Workload identity (e.g. IRSA) and an external secret manager, instead of static credentials and manual Kubernetes Secrets",
-    "High availability, autoscaling on queue depth, persistent metrics storage, real alert routing",
-    "Narrowing — not fully closing — the OpenAI-response-to-commit duplicate window, e.g. with an idempotency key on the LLM call",
-], MARGIN + 6.35, 2.62, 4.95, size=12.8, gap=13, height=3.8)
+RB_W, RB_H, RB_GAP = 1.75, 0.95, 0.22
+RB_Y = 2.05
+rb_x = [MARGIN + i * (RB_W + RB_GAP) for i in range(6)]
+REPO = dict(left=rb_x[0], top=RB_Y, w=RB_W, h=RB_H)
+CI = dict(left=rb_x[1], top=RB_Y, w=RB_W, h=RB_H)
+REG = dict(left=rb_x[2], top=RB_Y, w=RB_W, h=RB_H)
+GITOPS = dict(left=rb_x[3], top=RB_Y, w=RB_W, h=RB_H)
+ARGO = dict(left=rb_x[4], top=RB_Y, w=RB_W, h=RB_H)
+PROD = dict(left=rb_x[5], top=RB_Y, w=RB_W, h=RB_H)
 
-footer(s, "Tradeoffs and roadmap", 10)
-add_notes(s, "This slide is deliberately unflattering on the left and forward-looking on the "
-             "right. Every item on the left is something I found or decided, not something a "
-             "reviewer would have to find themselves. On the right: frame it as 'what I'd do "
-             "next with more time and a real budget,' not 'what's missing from this "
-             "submission' - the take-home was deliberately scoped smaller than this list on "
-             "purpose. Note the duplicate-call window is narrowed by an idempotency key, not "
-             "solved outright - a transactional outbox pattern doesn't apply here since the "
-             "non-atomic boundary is an external OpenAI call, not two local writes. Other "
-             "production gaps worth naming if asked: Prometheus/Grafana storage is emptyDir "
-             "today (no history across restarts), Grafana uses anonymous viewer access, and "
-             "cost figures are estimates from a hardcoded pricing table - all explicit, "
-             "documented tradeoffs for a local take-home, not oversights.")
+dbox(s, "Application\nrepository", **REPO, fill=SLATE)
+dbox(s, "CI pipeline", **CI, fill=TEAL)
+dbox(s, "Container\nregistry", **REG, fill=SLATE)
+dbox(s, "GitOps\nrepository", **GITOPS, fill=AMBER)
+dbox(s, "Argo CD", **ARGO, fill=TEAL_DARK)
+dbox(s, "Kubernetes\nproduction\ncluster", **PROD, fill=NAVY, size=11.5)
+
+stages = [REPO, CI, REG, GITOPS, ARGO, PROD]
+arrow_labels = ["commit", "build & push", "update tag", "git sync", "deploy"]
+for a, b, lbl in zip(stages, stages[1:], arrow_labels):
+    seg(s, *edge(a, "r"), *edge(b, "l"), color=SLATE)
+    dlabel(s, (edge(a, "r")[0] + edge(b, "l")[0]) / 2, RB_Y + RB_H + 0.1, lbl, width=RB_W)
+
+CARD_W, CARD_H, CARD_GAP_X, CARD_GAP_Y = 5.55, 1.35, 0.5, 0.2
+CARD_Y1 = 3.65
+CARD_Y2 = CARD_Y1 + CARD_H + CARD_GAP_Y
+CARD_X1 = MARGIN
+CARD_X2 = MARGIN + CARD_W + CARD_GAP_X
+
+roadmap_points = [
+    (SLATE, "1", "Repository separation",
+     "App code and the Dockerfile stay here; Helm config moves to a separate GitOps repo — Terraform can split out too.",
+     CARD_X1, CARD_Y1),
+    (TEAL, "2", "CI pipeline",
+     "Every change: tests, security scan, build, tag with the commit SHA, push to the registry, then update the GitOps repo's tag.",
+     CARD_X2, CARD_Y1),
+    (TEAL_DARK, "3", "Argo CD deployment",
+     "Argo CD syncs the GitOps repo into the cluster — changes reviewed via Git, rollback by reverting to a known-good commit.",
+     CARD_X1, CARD_Y2),
+    (NAVY, "4", "Production reliability",
+     "Managed RDS/SQS/S3/DLQ, a cloud secret manager and workload identity, multiple replicas, queue-depth autoscaling, monitoring and backups.",
+     CARD_X2, CARD_Y2),
+]
+for accent, num, head, body, cx, cy in roadmap_points:
+    panel(s, cx, cy, CARD_W, CARD_H, accent=accent)
+    badge = s.shapes.add_shape(MSO_SHAPE.OVAL, Inches(cx + 0.25), Inches(cy + 0.2), Inches(0.32), Inches(0.32))
+    badge.fill.solid()
+    badge.fill.fore_color.rgb = accent
+    badge.line.fill.background()
+    no_shadow(badge)
+    btf = badge.text_frame
+    btf.word_wrap = False
+    btf.vertical_anchor = MSO_ANCHOR.MIDDLE
+    btf.margin_left = 0
+    btf.margin_right = 0
+    bp = btf.paragraphs[0]
+    bp.alignment = PP_ALIGN.CENTER
+    br = bp.add_run()
+    br.text = num
+    _font(br, 12.5, WHITE, bold=True)
+
+    ht = s.shapes.add_textbox(Inches(cx + 0.7), Inches(cy + 0.15), Inches(CARD_W - 1.0), Inches(0.35))
+    hp = ht.text_frame.paragraphs[0]
+    hr = hp.add_run()
+    hr.text = head
+    _font(hr, 14.5, NAVY, bold=True)
+
+    dt = s.shapes.add_textbox(Inches(cx + 0.25), Inches(cy + 0.58), Inches(CARD_W - 0.5), Inches(0.7))
+    dtf = dt.text_frame
+    dtf.word_wrap = True
+    dp = dtf.paragraphs[0]
+    dp.line_spacing = 1.05
+    dr = dp.add_run()
+    dr.text = body
+    _font(dr, 12.5, INK)
+
+footer(s, "Production roadmap", 10)
+add_notes(s, "This is a proposed future CI/CD path, not something implemented in this "
+             "take-home - worth being explicit about that distinction if asked. The flow: a "
+             "commit to the application repo triggers CI (tests, security scanning, image "
+             "build, SHA tag, push to a registry), which then updates the image tag in a "
+             "separate GitOps repo; Argo CD watches that repo and reconciles the cluster to "
+             "match it. Rollback becomes 'revert a Git commit,' not 'run a manual kubectl "
+             "command.' Separating the GitOps repo from the application repo also means "
+             "environment-specific Helm values (dev/staging/prod) never need to touch the "
+             "application codebase.\n\n"
+             "Honest tradeoffs/exclusions worth naming if asked, since they're not their own "
+             "slide anymore: no exactly-once processing claim anywhere (SQS is at-least-once "
+             "by design); a crash between an OpenAI response and the DB commit can still cause "
+             "one extra paid call, bounded and rare, not eliminated (narrowed - not solved - by "
+             "an idempotency key on the LLM call, not a transactional outbox, since the "
+             "non-atomic boundary is an external API call, not two local writes); LocalStack "
+             "doesn't enforce the IAM policies Terraform defines; and the take-home was scoped "
+             "down on purpose - no CI, no service mesh, no ORM, no new database.")
 
 prs.save(str(OUT))
 print(f"Wrote {OUT} ({len(prs.slides)} slides)")
